@@ -182,6 +182,24 @@ def _masked_mean(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     return (values * weights).sum() / weights.sum()
 
 
+def multi_positive_contrastive_loss(
+    logits: torch.Tensor,
+    query_target_ids: torch.Tensor,
+    candidate_target_ids: torch.Tensor,
+    valid_queries: torch.Tensor,
+    valid_candidates: torch.Tensor,
+) -> torch.Tensor:
+    """Contrast queries against one target column per session, allowing duplicate targets."""
+    candidates = valid_candidates[None]
+    positives = query_target_ids[:, None].eq(candidate_target_ids[None]) & candidates
+    if not positives[valid_queries].any(dim=1).all():
+        raise ValueError("every valid query must have a valid positive target")
+    denominator = logits.masked_fill(~candidates, -torch.inf).logsumexp(dim=1)
+    numerator = logits.masked_fill(~positives, -torch.inf).logsumexp(dim=1)
+    losses = torch.where(valid_queries, denominator - numerator, torch.zeros_like(denominator))
+    return losses.sum() / valid_queries.sum()
+
+
 @dataclass(frozen=True)
 class DenseRewardConfig:
     potential_scale: float = 0.4
@@ -456,23 +474,18 @@ class PPOTrainer:
                         F.mse_loss(values, returns[:, indices].flatten(), reduction="none"), valid
                     )
 
-                    target_ids = trajectory.target_ids[:, indices].flatten()
+                    session_target_ids = trajectory.target_ids[0, indices]
                     target_embeddings = self.model.encode_products(
-                        self.catalog_token_ids[target_ids],
-                        self.catalog_mask[target_ids],
+                        self.catalog_token_ids[session_target_ids],
+                        self.catalog_mask[session_target_ids],
                     )
                     contrastive_logits = self.model.scores(queries, target_embeddings)
-                    contrastive_logits = contrastive_logits.masked_fill(~valid[None], -torch.inf)
-                    contrastive_logits = torch.where(
-                        valid[:, None], contrastive_logits, torch.zeros_like(contrastive_logits)
-                    )
-                    contrastive_loss = _masked_mean(
-                        F.cross_entropy(
-                            contrastive_logits,
-                            torch.arange(queries.shape[0], device=self.device),
-                            reduction="none",
-                        ),
+                    contrastive_loss = multi_positive_contrastive_loss(
+                        contrastive_logits,
+                        trajectory.target_ids[:, indices].flatten(),
+                        session_target_ids,
                         valid,
+                        valid_sessions,
                     )
                     mean_entropy = _masked_mean(entropy, valid)
                     loss = (

@@ -11,6 +11,7 @@ from rollout.ppo import (
     DualEncoderActorCritic,
     dense_reward,
     fixed_minibatches,
+    multi_positive_contrastive_loss,
     ordered_log_prob_and_entropy,
     target_rank_potential,
 )
@@ -51,6 +52,45 @@ class PPOTest(unittest.TestCase):
         stateful, _ = model.encode_queries(second_ids, second_mask, hidden)
         stateless, _ = model.encode_queries(second_ids, second_mask)
         self.assertFalse(torch.allclose(stateful, stateless))
+
+    def test_contrastive_loss_uses_one_target_column_per_session(self) -> None:
+        logits = torch.tensor([
+            [2.0, 0.0],
+            [0.0, 2.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ])
+        target_ids = torch.tensor([10, 20])
+        loss = multi_positive_contrastive_loss(
+            logits,
+            target_ids.repeat(2),
+            target_ids,
+            torch.ones(4, dtype=torch.bool),
+            torch.ones(2, dtype=torch.bool),
+        )
+        expected = torch.nn.functional.cross_entropy(logits, torch.tensor([0, 1, 0, 1]))
+        self.assertTrue(torch.allclose(loss, expected))
+
+    def test_contrastive_loss_treats_duplicate_targets_as_positives(self) -> None:
+        loss = multi_positive_contrastive_loss(
+            torch.tensor([[1.0, 1.0]]),
+            torch.tensor([10]),
+            torch.tensor([10, 10]),
+            torch.tensor([True]),
+            torch.tensor([True, True]),
+        )
+        self.assertAlmostEqual(float(loss), 0.0)
+
+    def test_contrastive_loss_ignores_padded_sessions(self) -> None:
+        loss = multi_positive_contrastive_loss(
+            torch.tensor([[1.0, 100.0], [0.0, 0.0]]),
+            torch.tensor([10, 20]),
+            torch.tensor([10, 20]),
+            torch.tensor([True, False]),
+            torch.tensor([True, False]),
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertAlmostEqual(float(loss), 0.0)
 
     def test_rank_potential_and_dense_reward_improve_with_rank(self) -> None:
         current = target_rank_potential(torch.tensor([[0.0, 1.0, 2.0]]), torch.tensor([0]))
