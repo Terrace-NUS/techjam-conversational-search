@@ -49,7 +49,7 @@ def _clean_constraint(value: str, limit: int) -> str:
     return re.sub(r"\s+", " ", value).strip(" -;,.\t\n")[:limit].rstrip()
 
 
-def intent_card(product: dict, limit: int = 180) -> dict:
+def intent_candidates(product: dict, limit: int = 180) -> list[str]:
     title = _clean_constraint(str(product.get("title") or "product"), limit)
     candidates = [*_flatten_values(product.get("features")), *_flatten_values(product.get("details"))]
     corpus = searchable_text(product)
@@ -62,10 +62,13 @@ def intent_card(product: dict, limit: int = 180) -> dict:
     if product.get("price") not in (None, ""):
         candidates.append(f"budget around ${product['price']}")
     cleaned = list(dict.fromkeys(_clean_constraint(item, limit) for item in candidates if _clean_constraint(item, limit)))
-    if not cleaned:
-        cleaned = [title]
+    return cleaned or [title]
+
+
+def intent_card(product: dict, limit: int = 180) -> dict:
+    cleaned = intent_candidates(product, limit)
     return {
-        "target_category": title,
+        "target_category": _clean_constraint(str(product.get("title") or "product"), limit),
         "hard_constraints": cleaned[:2],
         "soft_preferences": cleaned[2:4] or cleaned[:1],
     }

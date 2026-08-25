@@ -1,10 +1,12 @@
 __pycache__/
 *.py[cod]
+.venv/
 .DS_Store
 .env
 results.json
 data/catalog.jsonl
 data/releases/
+data/generated/
 # Organizer-only code, private evaluation data, manifests, and build reports.
 organizer/
 secure/
@@ -16,3 +18,7 @@ docs/participant_release_checklist.md
 tests/test_5core_builder.py
 tests/test_organizer_pipeline.py
 *.log
+runs/
+checkpoints/
+experiments/
+configs/__pycache__/

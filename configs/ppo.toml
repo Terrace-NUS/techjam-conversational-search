@@ -1,0 +1,42 @@
+[paths]
+catalog = "data/catalog.jsonl"
+dataset = "data/public_set.jsonl"
+output = "ppo-checkpoint.pt"
+tensorboard_dir = "runs/ppo"
+
+[run]
+device = "auto"
+precision = "bf16"
+iterations = 2400
+seed = 42
+
+[model]
+hidden_size = 128
+max_vocab = 20000
+max_product_length = 64
+max_query_length = 128
+
+[rollout]
+batch_size = 512
+candidate_count = 128
+top_k = 10
+max_turns = 10
+randomize_cards = true
+
+[ppo]
+gamma = 0.99
+gae_lambda = 0.95
+clip_ratio = 0.2
+value_coefficient = 0.5
+entropy_coefficient = 0.01
+contrastive_coefficient = 0.1
+learning_rate = 0.0003
+epochs = 4
+minibatch_size = 512
+max_grad_norm = 1.0
+
+[reward]
+potential_scale = 0.4
+revealed_constraint_reward = 0.03
+no_information_penalty = 0.02
+turn_cost = 0.01

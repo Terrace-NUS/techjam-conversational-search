@@ -1,0 +1,15 @@
+[project]
+name = "techjam-conversational-search"
+version = "0.1.0"
+description = "Conversational product search simulator and PPO training"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ray>=2.40",
+    "tensorboard>=2.18",
+    "tomli>=2.0; python_version < '3.11'",
+    "torch>=2.6",
+]
+
+[tool.uv]
+package = false

@@ -34,10 +34,16 @@ Verify the downloaded file using the published `SHA256SUMS` file.
 
 ## Run the Starter
 
-Python 3.10 or later is recommended. The starter uses only the Python standard library.
+Python 3.10 or later is required. Install all project dependencies with uv:
 
 ```bash
-python3 -m evaluator.local_evaluator
+uv sync
+```
+
+The starter itself uses only the Python standard library.
+
+```bash
+uv run python -m evaluator.local_evaluator
 ```
 
 Edit `starter/agent.py` to implement your system. Do not edit the evaluator or public labels when reporting your local score.
@@ -45,6 +51,69 @@ The command writes per-session results and aggregate metrics to `results.json`.
 
 The included weak BM25 starter scores Hit Rate@10 `0.125`, MRR `0.068034`, and
 MTTC `9.81` on the released public set. See `docs/baseline_results.json`.
+
+## GPU Rollouts (Optional)
+
+For batched policy training, `rollout.gpu_simulator.TensorRolloutSimulator`
+keeps episode state and reward calculation in PyTorch tensors. It selects
+CUDA, then Apple MPS, then CPU automatically. Dependencies are installed by
+the root `uv sync` command.
+
+The rollout action format is integer catalog indices shaped `[batch, top_k]`
+and attribute IDs shaped `[batch]`; use `RolloutDataset.catalog_ids` to map a
+selected index back to `parent_asin`. The official evaluator remains the
+reproducibility check and is intentionally unchanged.
+
+Pass `randomize_cards=True` and an optional `seed` to `load_rollout_dataset`
+to sample four constraints per target and randomly split them into two hard
+and two soft constraints for training rollouts.
+
+Run the from-scratch tokenizer, dual-encoder, dense-reward PPO smoke test with:
+
+```bash
+uv run python -m scripts.train_ppo \
+  --config configs/ppo.toml \
+  --experiment-dir experiments/ppo-exp-001 \
+  --checkpoint-interval 10
+uv run tensorboard --logdir experiments/ppo-exp-001/tensorboard
+```
+
+Training defaults are in `configs/ppo.toml`. Use any CLI option to override
+its TOML value, for example `--batch-size 256` or `--precision fp32`. BF16
+autocast is enabled by default while model parameters and optimizer state stay
+FP32. Each experiment directory
+contains `tensorboard/` and `checkpoints/`. `latest.pt` is updated every iteration,
+periodic `step-*.pt` files are written at `--checkpoint-interval`, and
+`final.pt` is written after normal training. TensorBoard logs
+rollout return, hit rate, dense reward, PPO/value/contrastive losses, entropy,
+gradient norm, and learning rate once per training iteration.
+
+The policy sees only conversation text. Hidden targets are used for rank-based
+training rewards and in-batch contrastive learning, never as model inputs.
+The default dense reward is `official + 0.4 * delta_rank_potential + 0.03 *
+new_constraints - 0.02 * no_information - 0.01 * turn`, where rank potential
+is the target's normalized log rank over the current catalog.
+
+Generate 10 million synthetic sessions as Ray-produced pickle parts:
+
+```bash
+uv run python -m scripts.generate_rollout_data --workers 8
+```
+
+Add `--resume` to verify existing pickle parts and continue an interrupted run.
+Generated data is written under `data/generated/rollout-10m/pkl/` and is
+ignored by Git.
+
+Generate an 800-session private-style test set with targets disjoint from the
+public 200 sessions and the specification's exact `320/320/120/40` scenario
+mix:
+
+```bash
+uv run python -m scripts.generate_private_test
+```
+
+This writes `test.pkl`, `test.jsonl`, and `metadata.json` under
+`data/generated/private-test-800/`.
 
 ## Agent Interface
 
