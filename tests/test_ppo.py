@@ -6,8 +6,9 @@ import torch
 
 from rollout.gpu_simulator import ASK_SPECIFIC, RolloutObservation
 from rollout.ppo import (
+    BPETokenizer,
     DenseRewardConfig,
-    WordTokenizer,
+    DualEncoderActorCritic,
     dense_reward,
     fixed_minibatches,
     ordered_log_prob_and_entropy,
@@ -22,12 +23,15 @@ class PPOTest(unittest.TestCase):
         self.assertEqual(sum(int(valid.sum()) for _, valid in minibatches), 70)
         self.assertTrue(all(int(indices.max()) < 70 for indices, _ in minibatches))
 
-    def test_tokenizer_is_bounded_and_handles_unknown_words(self) -> None:
-        tokenizer = WordTokenizer.fit(["red shoe", "blue shoe"], max_vocab=4)
-        token_ids, mask = tokenizer.encode_batch(["unknown shoe"], 4, "cpu")
-        self.assertEqual(token_ids.shape, (1, 4))
-        self.assertEqual(int(mask.sum()), 2)
-        self.assertIn(WordTokenizer.UNK, token_ids[0].tolist())
+    def test_byte_bpe_is_bounded_and_serializable(self) -> None:
+        tokenizer = BPETokenizer.fit(["red shoe", "blue shoe"], max_vocab=300)
+        token_ids, mask = tokenizer.encode_batch(["新款 shoe"], 16, "cpu")
+        restored = BPETokenizer.from_str(tokenizer.to_str())
+        restored_ids, restored_mask = restored.encode_batch(["新款 shoe"], 16, "cpu")
+        self.assertLessEqual(len(tokenizer), 300)
+        self.assertNotIn(BPETokenizer.UNK, token_ids[0, mask[0]].tolist())
+        self.assertTrue(torch.equal(token_ids, restored_ids))
+        self.assertTrue(torch.equal(mask, restored_mask))
 
     def test_ordered_action_probability_is_finite(self) -> None:
         logits = torch.tensor([[2.0, 1.0, 0.0]])
@@ -35,6 +39,18 @@ class PPOTest(unittest.TestCase):
         log_probability, entropy = ordered_log_prob_and_entropy(logits, selected)
         self.assertTrue(torch.isfinite(log_probability).all())
         self.assertGreater(float(entropy[0]), 0.0)
+
+    def test_gru_hidden_state_changes_the_next_turn_encoding(self) -> None:
+        tokenizer = BPETokenizer.fit(
+            ["first preference", "second preference"], max_vocab=300
+        )
+        model = DualEncoderActorCritic(len(tokenizer), hidden_size=8)
+        first_ids, first_mask = tokenizer.encode_batch(["first preference"], 4, "cpu")
+        second_ids, second_mask = tokenizer.encode_batch(["second preference"], 4, "cpu")
+        _, hidden = model.encode_queries(first_ids, first_mask)
+        stateful, _ = model.encode_queries(second_ids, second_mask, hidden)
+        stateless, _ = model.encode_queries(second_ids, second_mask)
+        self.assertFalse(torch.allclose(stateful, stateless))
 
     def test_rank_potential_and_dense_reward_improve_with_rank(self) -> None:
         current = target_rank_potential(torch.tensor([[0.0, 1.0, 2.0]]), torch.tensor([0]))

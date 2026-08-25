@@ -7,13 +7,13 @@ from pathlib import Path
 
 import torch
 
-from rollout.ppo import DualEncoderActorCritic, PPOTrainer, WordTokenizer
+from rollout.ppo import BPETokenizer, DualEncoderActorCritic, PPOTrainer
 from scripts.train_ppo import save_checkpoint
 
 
 class CheckpointTest(unittest.TestCase):
     def test_checkpoint_contains_training_state(self) -> None:
-        tokenizer = WordTokenizer.fit(["a product"])
+        tokenizer = BPETokenizer.fit(["a product"], max_vocab=300)
         model = DualEncoderActorCritic(len(tokenizer), hidden_size=8)
         trainer = PPOTrainer(
             model,
@@ -32,6 +32,9 @@ class CheckpointTest(unittest.TestCase):
         self.assertEqual(checkpoint["iteration"], 3)
         self.assertIn("model", checkpoint)
         self.assertIn("optimizer", checkpoint)
+        self.assertEqual(
+            BPETokenizer.from_str(checkpoint["tokenizer"]).to_str(), tokenizer.to_str()
+        )
 
 
 if __name__ == "__main__":

@@ -1,19 +1,17 @@
 [paths]
 catalog = "data/catalog.jsonl"
-dataset = "data/public_set.jsonl"
-output = "ppo-checkpoint.pt"
-tensorboard_dir = "runs/ppo"
+rollout_data = "data/generated/rollout-10m/pkl"
 
 [run]
 device = "auto"
 precision = "bf16"
-iterations = 2400
+iterations = 19532
 seed = 42
 
 [model]
 hidden_size = 128
 max_vocab = 20000
-max_product_length = 64
+max_product_length = 128
 max_query_length = 128
 
 [rollout]
@@ -21,7 +19,6 @@ batch_size = 512
 candidate_count = 128
 top_k = 10
 max_turns = 10
-randomize_cards = true
 
 [ppo]
 gamma = 0.99

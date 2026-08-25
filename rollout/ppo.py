@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import re
 from contextlib import nullcontext
 from collections import Counter
 from dataclasses import dataclass
@@ -10,6 +9,11 @@ from typing import Iterable
 import torch
 from torch import nn
 from torch.nn import functional as F
+from tokenizers import Tokenizer
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+from tokenizers.models import BPE
+from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.trainers import BpeTrainer
 
 from .gpu_simulator import (
     ASK_SPECIFIC,
@@ -20,26 +24,46 @@ from .gpu_simulator import (
 )
 
 
-TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
-
-
-class WordTokenizer:
+class BPETokenizer:
     PAD = 0
     UNK = 1
+    PAD_TOKEN = "[PAD]"
+    UNK_TOKEN = "[UNK]"
 
-    def __init__(self, vocabulary: dict[str, int]) -> None:
-        self.vocabulary = vocabulary
+    def __init__(self, tokenizer: Tokenizer) -> None:
+        if tokenizer.token_to_id(self.PAD_TOKEN) != self.PAD:
+            raise ValueError("BPE tokenizer must assign [PAD] token ID 0")
+        if tokenizer.token_to_id(self.UNK_TOKEN) != self.UNK:
+            raise ValueError("BPE tokenizer must assign [UNK] token ID 1")
+        self.tokenizer = tokenizer
 
     @classmethod
-    def fit(cls, texts: Iterable[str], max_vocab: int = 20_000) -> WordTokenizer:
-        counts: Counter[str] = Counter()
-        for text in texts:
-            counts.update(token.lower() for token in TOKEN_RE.findall(text))
-        vocabulary = {token: index + 2 for index, (token, _) in enumerate(counts.most_common(max_vocab - 2))}
-        return cls(vocabulary)
+    def fit(cls, texts: Iterable[str], max_vocab: int = 20_000) -> BPETokenizer:
+        if max_vocab < 258:
+            raise ValueError("byte-level BPE vocabulary must contain at least 258 tokens")
+        tokenizer = Tokenizer(BPE(unk_token=cls.UNK_TOKEN))
+        tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
+        tokenizer.decoder = ByteLevelDecoder()
+        tokenizer.train_from_iterator(
+            texts,
+            trainer=BpeTrainer(
+                vocab_size=max_vocab,
+                special_tokens=[cls.PAD_TOKEN, cls.UNK_TOKEN],
+                initial_alphabet=ByteLevel.alphabet(),
+                show_progress=False,
+            ),
+        )
+        return cls(tokenizer)
+
+    @classmethod
+    def from_str(cls, serialized: str) -> BPETokenizer:
+        return cls(Tokenizer.from_str(serialized))
+
+    def to_str(self) -> str:
+        return self.tokenizer.to_str()
 
     def __len__(self) -> int:
-        return len(self.vocabulary) + 2
+        return self.tokenizer.get_vocab_size()
 
     def encode_batch(
         self,
@@ -48,9 +72,8 @@ class WordTokenizer:
         device: torch.device | str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rows = [
-            [self.vocabulary.get(token.lower(), self.UNK) for token in TOKEN_RE.findall(text)][-max_length:]
-            or [self.UNK]
-            for text in texts
+            encoding.ids[-max_length:] or [self.UNK]
+            for encoding in self.tokenizer.encode_batch(list(texts))
         ]
         token_ids = torch.full((len(rows), max_length), self.PAD, dtype=torch.long)
         mask = torch.zeros((len(rows), max_length), dtype=torch.bool)
@@ -64,18 +87,23 @@ class WordTokenizer:
 class DualEncoderActorCritic(nn.Module):
     def __init__(self, vocab_size: int, hidden_size: int = 128, attribute_actions: int = 11) -> None:
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, hidden_size, padding_idx=WordTokenizer.PAD)
+        self.embedding = nn.Embedding(vocab_size, hidden_size, padding_idx=BPETokenizer.PAD)
         self.query_encoder = nn.GRU(hidden_size, hidden_size, batch_first=True)
         self.product_projection = nn.Linear(hidden_size, hidden_size)
         self.attribute_head = nn.Linear(hidden_size, attribute_actions)
         self.value_head = nn.Linear(hidden_size, 1)
         self.logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
 
-    def encode_queries(self, token_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        output, _ = self.query_encoder(self.embedding(token_ids))
+    def encode_queries(
+        self,
+        token_ids: torch.Tensor,
+        mask: torch.Tensor,
+        hidden: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output, _ = self.query_encoder(self.embedding(token_ids), hidden)
         last = mask.sum(dim=1).clamp(min=1) - 1
         features = output[torch.arange(output.shape[0], device=output.device), last]
-        return F.normalize(features, dim=-1)
+        return F.normalize(features, dim=-1), features.unsqueeze(0)
 
     def encode_products(self, token_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         embedded = self.embedding(token_ids)
@@ -218,7 +246,7 @@ class PPOTrainer:
     def __init__(
         self,
         model: DualEncoderActorCritic,
-        tokenizer: WordTokenizer,
+        tokenizer: BPETokenizer,
         catalog_token_ids: torch.Tensor,
         catalog_mask: torch.Tensor,
         *,
@@ -261,7 +289,8 @@ class PPOTrainer:
     def collect(self, dataset: RolloutDataset) -> tuple[Trajectory, dict[str, float]]:
         simulator = TensorRolloutSimulator(dataset.batch, device=self.device, max_turns=self.max_turns)
         observation = simulator.reset()
-        histories = list(dataset.initial_messages)
+        messages = list(dataset.initial_messages)
+        hidden: torch.Tensor | None = None
         with self._autocast():
             product_embeddings = encode_catalog(self.model, self.catalog_token_ids, self.catalog_mask)
         storage: dict[str, list[torch.Tensor]] = {
@@ -274,10 +303,10 @@ class PPOTrainer:
         for _ in range(simulator.max_turns):
             active = ~observation.done
             input_ids, input_mask = self.tokenizer.encode_batch(
-                histories, self.max_query_length, self.device
+                messages, self.max_query_length, self.device
             )
             with self._autocast():
-                queries = self.model.encode_queries(input_ids, input_mask)
+                queries, next_hidden = self.model.encode_queries(input_ids, input_mask, hidden)
                 all_scores = self.model.scores(queries, product_embeddings)
                 current_potential = target_rank_potential(all_scores, simulator.batch.target_ids)
                 candidate_ids = all_scores.topk(self.candidate_count, dim=1).indices
@@ -293,15 +322,14 @@ class PPOTrainer:
 
             step = simulator.step(recommendations, attribute_actions - 1)
             replies = dataset.messages(step.observation)
-            next_histories = [
-                history if done else f"{history} {reply}"
-                for history, reply, done in zip(histories, replies, step.observation.done.detach().cpu().tolist())
-            ]
             next_ids, next_mask = self.tokenizer.encode_batch(
-                next_histories, self.max_query_length, self.device
+                replies, self.max_query_length, self.device
             )
             with self._autocast():
-                next_queries = self.model.encode_queries(next_ids, next_mask)
+                encoded_next_queries, _ = self.model.encode_queries(next_ids, next_mask, next_hidden)
+                next_queries = torch.where(
+                    step.observation.done[:, None], queries, encoded_next_queries
+                )
                 next_scores = self.model.scores(next_queries, product_embeddings)
                 next_potential = target_rank_potential(next_scores, simulator.batch.target_ids)
             rewards = dense_reward(
@@ -326,7 +354,8 @@ class PPOTrainer:
                 ("active", active),
             ):
                 storage[name].append(value.detach())
-            histories = next_histories
+            hidden = next_hidden * (~step.observation.done)[None, :, None].to(next_hidden.dtype)
+            messages = replies
             observation = step.observation
 
         trajectory = Trajectory(
@@ -359,36 +388,44 @@ class PPOTrainer:
 
     def update(self, trajectory: Trajectory) -> dict[str, float]:
         advantages, returns = self._advantages(trajectory)
-        active = trajectory.active.flatten()
-        fields = {
-            "input_ids": trajectory.input_ids.flatten(0, 1)[active],
-            "input_mask": trajectory.input_mask.flatten(0, 1)[active],
-            "candidate_ids": trajectory.candidate_ids.flatten(0, 1)[active],
-            "selected_positions": trajectory.selected_positions.flatten(0, 1)[active],
-            "attribute_actions": trajectory.attribute_actions.flatten()[active],
-            "old_log_prob": trajectory.old_log_prob.flatten()[active],
-            "returns": returns.flatten()[active],
-            "advantages": advantages.flatten()[active],
-            "target_ids": trajectory.target_ids.flatten()[active],
-        }
-        fields["advantages"] = (fields["advantages"] - fields["advantages"].mean()) / (
-            fields["advantages"].std(unbiased=False) + 1e-8
-        )
+        active = trajectory.active
+        active_advantages = advantages[active]
+        normalized_advantages = torch.zeros_like(advantages)
+        normalized_advantages[active] = (
+            active_advantages - active_advantages.mean()
+        ) / (active_advantages.std(unbiased=False) + 1e-8)
         totals = Counter()
         updates = 0
-        count = fields["old_log_prob"].shape[0]
-        padding = (-count) % self.config.minibatch_size
+        turn_count, session_count = active.shape
+        sessions_per_minibatch = max(1, self.config.minibatch_size // turn_count)
+        padded_sessions = (-session_count) % sessions_per_minibatch
+        count = int(active.sum())
 
         for _ in range(self.config.epochs):
-            for indices, valid in fixed_minibatches(count, self.config.minibatch_size, self.device):
-                batch = {name: value[indices] for name, value in fields.items()}
+            for indices, valid_sessions in fixed_minibatches(
+                session_count, sessions_per_minibatch, self.device
+            ):
                 with self._autocast():
-                    queries = self.model.encode_queries(batch["input_ids"], batch["input_mask"])
+                    hidden: torch.Tensor | None = None
+                    query_steps: list[torch.Tensor] = []
+                    for turn in range(turn_count):
+                        queries, hidden = self.model.encode_queries(
+                            trajectory.input_ids[turn, indices],
+                            trajectory.input_mask[turn, indices],
+                            hidden,
+                        )
+                        query_steps.append(queries)
+                        continuing = ~trajectory.dones[turn, indices] & valid_sessions
+                        hidden = hidden * continuing[None, :, None].to(hidden.dtype)
+
+                    queries = torch.stack(query_steps).flatten(0, 1)
+                    valid = (active[:, indices] & valid_sessions[None]).flatten()
                     attribute_logits, values = self.model.policy_value(queries)
                     attribute_distribution = torch.distributions.Categorical(logits=attribute_logits)
 
-                    candidate_tokens = self.catalog_token_ids[batch["candidate_ids"]]
-                    candidate_masks = self.catalog_mask[batch["candidate_ids"]]
+                    candidate_ids = trajectory.candidate_ids[:, indices].flatten(0, 1)
+                    candidate_tokens = self.catalog_token_ids[candidate_ids]
+                    candidate_masks = self.catalog_mask[candidate_ids]
                     shape = candidate_tokens.shape
                     candidate_embeddings = self.model.encode_products(
                         candidate_tokens.flatten(0, 1), candidate_masks.flatten(0, 1)
@@ -397,22 +434,32 @@ class PPOTrainer:
                         queries[:, None] * candidate_embeddings
                     ).sum(dim=-1) * self.model.logit_scale.exp().clamp(max=100.0)
                     recommendation_log_prob, recommendation_entropy = ordered_log_prob_and_entropy(
-                        candidate_logits, batch["selected_positions"]
+                        candidate_logits,
+                        trajectory.selected_positions[:, indices].flatten(0, 1),
                     )
                     new_log_prob = (
                         recommendation_log_prob
-                        + attribute_distribution.log_prob(batch["attribute_actions"])
+                        + attribute_distribution.log_prob(
+                            trajectory.attribute_actions[:, indices].flatten()
+                        )
                     )
                     entropy = recommendation_entropy + attribute_distribution.entropy()
-                    ratio = (new_log_prob - batch["old_log_prob"]).exp()
-                    unclipped = ratio * batch["advantages"]
-                    clipped = ratio.clamp(1.0 - self.config.clip_ratio, 1.0 + self.config.clip_ratio) * batch["advantages"]
+                    old_log_prob = trajectory.old_log_prob[:, indices].flatten()
+                    batch_advantages = normalized_advantages[:, indices].flatten()
+                    ratio = (new_log_prob - old_log_prob).exp()
+                    unclipped = ratio * batch_advantages
+                    clipped = ratio.clamp(
+                        1.0 - self.config.clip_ratio, 1.0 + self.config.clip_ratio
+                    ) * batch_advantages
                     policy_loss = -_masked_mean(torch.minimum(unclipped, clipped), valid)
-                    value_loss = _masked_mean(F.mse_loss(values, batch["returns"], reduction="none"), valid)
+                    value_loss = _masked_mean(
+                        F.mse_loss(values, returns[:, indices].flatten(), reduction="none"), valid
+                    )
 
+                    target_ids = trajectory.target_ids[:, indices].flatten()
                     target_embeddings = self.model.encode_products(
-                        self.catalog_token_ids[batch["target_ids"]],
-                        self.catalog_mask[batch["target_ids"]],
+                        self.catalog_token_ids[target_ids],
+                        self.catalog_mask[target_ids],
                     )
                     contrastive_logits = self.model.scores(queries, target_embeddings)
                     contrastive_logits = contrastive_logits.masked_fill(~valid[None], -torch.inf)
@@ -422,7 +469,7 @@ class PPOTrainer:
                     contrastive_loss = _masked_mean(
                         F.cross_entropy(
                             contrastive_logits,
-                            torch.arange(self.config.minibatch_size, device=self.device),
+                            torch.arange(queries.shape[0], device=self.device),
                             reduction="none",
                         ),
                         valid,
@@ -453,5 +500,5 @@ class PPOTrainer:
         return {
             **{name: value / updates for name, value in totals.items()},
             "active_transitions": float(count),
-            "padding_fraction": padding / (count + padding),
+            "padding_fraction": padded_sessions / (session_count + padded_sessions),
         }

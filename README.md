@@ -64,11 +64,8 @@ and attribute IDs shaped `[batch]`; use `RolloutDataset.catalog_ids` to map a
 selected index back to `parent_asin`. The official evaluator remains the
 reproducibility check and is intentionally unchanged.
 
-Pass `randomize_cards=True` and an optional `seed` to `load_rollout_dataset`
-to sample four constraints per target and randomly split them into two hard
-and two soft constraints for training rollouts.
-
-Run the from-scratch tokenizer, dual-encoder, dense-reward PPO smoke test with:
+Run the from-scratch byte-level BPE tokenizer, dual-encoder, dense-reward PPO
+smoke test with:
 
 ```bash
 uv run python -m scripts.train_ppo \
@@ -88,8 +85,19 @@ periodic `step-*.pt` files are written at `--checkpoint-interval`, and
 rollout return, hit rate, dense reward, PPO/value/contrastive losses, entropy,
 gradient norm, and learning rate once per training iteration.
 
-The policy sees only conversation text. Hidden targets are used for rank-based
-training rewards and in-batch contrastive learning, never as model inputs.
+Training streams shuffled batches from the generated 10-million-session
+pickle shards configured by `paths.rollout_data`. A new batch is loaded every
+iteration, and each record's four constraints are reshuffled into a fresh
+two-hard/two-soft intent card. The default `19,532` iterations cover one pass
+over 10 million samples at batch size 512; the final fixed-size batch wraps by
+384 samples into the next shuffled pass. TensorBoard also logs samples seen
+and completed data epochs.
+
+The policy sees one customer message per turn and carries its GRU hidden state
+across the session. Recurrent PPO minibatches shuffle sessions while preserving
+and backpropagating through their 10-turn order; completed turns are masked.
+Hidden targets are used for rank-based training rewards and in-batch
+contrastive learning, never as model inputs.
 The default dense reward is `official + 0.4 * delta_rank_potential + 0.03 *
 new_constraints - 0.02 * no_information - 0.01 * turn`, where rank potential
 is the target's normalized log rank over the current catalog.
