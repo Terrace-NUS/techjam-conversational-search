@@ -5,7 +5,18 @@ from pathlib import Path
 import json
 import tempfile
 
-from evaluator.local_evaluator import catalog_index, evaluate, metric_summary, normalize_recommendations
+from evaluator.local_evaluator import (
+    DeepSeekReplyModel,
+    TemplateReplyModel,
+    build_reply_model,
+    catalog_index,
+    evaluate,
+    metric_summary,
+    normalize_recommendations,
+)
+from starter.agent import Agent, build_agent
+from starter.baseline import BaselineAgent
+from starter.v1 import V1Agent
 
 
 class EchoTargetAgent:
@@ -20,6 +31,68 @@ class EchoTargetAgent:
 
 
 class EvaluatorTest(unittest.TestCase):
+    def test_agent_factory_uses_abc_implementations(self) -> None:
+        self.assertTrue(issubclass(BaselineAgent, Agent))
+        self.assertTrue(issubclass(V1Agent, Agent))
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = Path(directory) / "catalog.jsonl"
+            catalog.write_text(json.dumps({"parent_asin": "A"}) + "\n", encoding="utf-8")
+            baseline = build_agent("baseline", catalog)
+            self.assertIsInstance(baseline, BaselineAgent)
+            baseline.connection.close()
+
+    def test_reply_model_selection_and_json_parsing(self) -> None:
+        self.assertIsInstance(build_reply_model("template"), TemplateReplyModel)
+        self.assertEqual(
+            DeepSeekReplyModel._parse_message('{"message":"A natural reply."}'),
+            "A natural reply.",
+        )
+        with self.assertRaises(ValueError):
+            DeepSeekReplyModel._parse_message("not json")
+
+    def test_deepseek_request_errors_are_not_replaced_with_template(self) -> None:
+        model = DeepSeekReplyModel(api_key="test-key")
+
+        class FailingClient:
+            class chat:
+                class completions:
+                    @staticmethod
+                    def create(**kwargs):
+                        raise RuntimeError("network failure")
+
+        model.client = FailingClient()
+        with self.assertRaises(RuntimeError):
+            model._rewrite("canonical", "initial message")
+
+    def test_deepseek_request_includes_few_shot_messages(self) -> None:
+        model = DeepSeekReplyModel(api_key="test-key")
+        captured = {}
+
+        class FakeClient:
+            class chat:
+                class completions:
+                    @staticmethod
+                    def create(**kwargs):
+                        captured.update(kwargs)
+                        return type("Response", (), {
+                            "choices": [type("Choice", (), {
+                                "message": type("Message", (), {"content": '{"message":"paraphrase"}'})()
+                            })()]
+                        })()
+
+        model.client = FakeClient()
+        self.assertEqual(model._rewrite("canonical", "initial message"), "paraphrase")
+        messages = captured["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(
+            len(messages),
+            1 + len(DeepSeekReplyModel.FEW_SHOT_MESSAGES) + 1,
+        )
+        self.assertEqual(messages[-1]["role"], "user")
+        self.assertEqual(captured["extra_body"], {"thinking": {"type": "disabled"}})
+        self.assertEqual(captured["temperature"], 0)
+        self.assertEqual(captured["max_tokens"], 256)
+
     def test_normalization_preserves_first_valid_unique_order(self) -> None:
         payload = [
             {"parent_asin": "A"}, {"parent_asin": "bad"}, {"parent_asin": "A"},

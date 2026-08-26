@@ -34,13 +34,43 @@ Verify the downloaded file using the published `SHA256SUMS` file.
 
 ## Run the Starter
 
-Python 3.10 or later is recommended. The starter uses only the Python standard library.
+Python 3.10 or later is recommended. The baseline starter uses the Python standard library;
+`uv sync` also installs the OpenAI SDK for the optional DeepSeek reply model.
 
 ```bash
-python3 -m evaluator.local_evaluator
+uv sync
+uv run python -m evaluator.local_evaluator --progress
 ```
 
-Edit `starter/agent.py` to implement your system. Do not edit the evaluator or public labels when reporting your local score.
+Agent implementations are selected with `--agent baseline|v1` (or
+`TECHJAM_AGENT`). `baseline` is the original BM25 starter; `v1` is the
+offline structured-retrieval implementation in `starter/v1/`.
+
+The evaluator uses deterministic template customer wording by default. To
+surface-realize each customer message with DeepSeek, set `DEEPSEEK_API_KEY`
+in the ignored `.env` file and run:
+
+```bash
+uv run python -m evaluator.local_evaluator --reply-model deepseek
+```
+
+Different sessions can run concurrently while each session remains turn-ordered:
+
+```bash
+uv run python -m evaluator.local_evaluator --reply-model deepseek --workers 8 --progress
+```
+
+Evaluation progress is printed to stderr. A partial result is written after
+each completed session to `results.json.partial` (or the path passed to
+`--checkpoint`), so an interrupted run still leaves usable metrics.
+
+`DEEPSEEK_MODEL` defaults to `deepseek-v4-flash`; `DEEPSEEK_BASE_URL` defaults
+to `https://api.deepseek.com`. DeepSeek request or response errors are fatal in
+this mode; they are not silently replaced with template text.
+
+Implement your agent against the ABC in `starter/agent.py`; the included
+baseline and V1 implementations are in `starter/baseline.py` and `starter/v1/`.
+Do not edit the evaluator or public labels when reporting your local score.
 The command writes per-session results and aggregate metrics to `results.json`.
 
 The included weak BM25 starter scores Hit Rate@10 `0.125`, MRR `0.068034`, and
