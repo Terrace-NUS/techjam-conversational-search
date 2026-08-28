@@ -99,14 +99,19 @@ SYSTEM_PROMPT = (
 )
 
 MODIFICATION_SYSTEM_PROMPT = (
-    "You generate deterministic customer-language data for a shopping benchmark. "
-    "For each requested attribute, return two clearly different intent stages. "
-    "The browsing fake_description must be exploratory, tentative, and broad: use "
-    "soft wording such as 'maybe', 'something like', or 'I'd be open to', and avoid "
-    "exact values unless necessary for a budget. The buying fake_description must be "
-    "decisive and specific, stating the fake value as a purchase requirement. These "
-    "must not be near-duplicates. correction_message must be a natural customer "
-    "message correcting an earlier wrong answer and stating the supplied true value. "
+    "You generate deterministic attribute data for a shopping benchmark. "
+    "For each requested attribute, return two fake values in the same compact style "
+    "as a product intent description, plus one correction message for each stage. "
+    "A fake_description is an attribute clue, not a customer message: write exactly "
+    "one short phrase or one short sentence, usually 3-12 words. Do not use first "
+    "person, explanations, reasons, filler, or multiple clauses. Do not add product "
+    "features, capabilities, components, brands, or use cases beyond the supplied "
+    "fake value. The browsing fake_description should be broad and tentative, while "
+    "the buying fake_description should be concrete and specific; keep both compact "
+    "and do not make them near-duplicates. The browsing form may use a soft modifier "
+    "such as 'maybe' or 'something like', but it must still be a short attribute clue. "
+    "The correction_message is separate: it should be a natural customer message "
+    "correcting an earlier wrong answer and stating the supplied true value. "
     "Do not invent facts, product types, brands, or use cases. Do not mention hidden "
     "state or ASINs, and return JSON only in this exact shape: "
     '{"fake_descriptions":{"browsing":{"attribute":"..."},"buying":{"attribute":"..."}},'
