@@ -13,6 +13,10 @@ from scripts.attributes import (
 )
 from scripts.llm_client import DeepSeekAttributeWriter, cached_json_call
 from scripts.modification import _conflicts_with_truth, build_modification
+from scripts.query_handler import ACTIVE_ATTRIBUTE_COUNT, QueryHandler
+from scripts.session import MODIFICATION_SESSION_RATE, create_session
+from scripts.schema import Item
+from scripts.schema import Modification
 
 SAMPLE_PRODUCT = {
     "parent_asin": "B0TESTITEM1",
@@ -61,6 +65,95 @@ class PriceBandTest(unittest.TestCase):
     def test_browsing_budget_ceiling_is_wider_than_exact_price(self) -> None:
         ceiling = browsing_budget_ceiling(36.5)
         self.assertGreater(ceiling, 36.5)
+
+
+class QueryHandlerTest(unittest.TestCase):
+    def _item(self) -> Item:
+        descriptions = {
+            intent: {attribute: f"{intent}:{attribute}" for attribute in (
+                "category", "brand", "budget", "material", "feature", "other"
+            )}
+            for intent in ("browsing", "buying")
+        }
+        return Item("ITEM", {}, descriptions)
+
+    def test_selects_exactly_four_attributes_deterministically(self) -> None:
+        first = QueryHandler("session-1", self._item())
+        second = QueryHandler("session-1", self._item())
+        self.assertEqual(first.active_attributes, second.active_attributes)
+        self.assertEqual(len(first.active_attributes), ACTIVE_ATTRIBUTE_COUNT)
+
+    def test_other_reveals_only_one_active_attribute_at_a_time(self) -> None:
+        handler = QueryHandler("session-2", self._item())
+        first = handler.answer("other")
+        self.assertIsNotNone(first)
+        self.assertEqual(len(handler.disclosed_attributes), 1)
+        second = handler.answer("other")
+        self.assertIsNotNone(second)
+        self.assertEqual(len(handler.disclosed_attributes), 2)
+
+    def test_inactive_attribute_is_not_revealed(self) -> None:
+        handler = QueryHandler("session-3", self._item())
+        inactive = next(name for name in ("category", "brand", "budget", "material", "feature", "other") if name not in handler.active_attributes)
+        self.assertIsNone(handler.answer(inactive))
+
+    def test_fewer_than_four_attributes_is_rejected(self) -> None:
+        item = Item(
+            "ITEM_WITH_THREE_ATTRIBUTES",
+            {},
+            {"browsing": {"category": "shirts", "brand": "Acme", "budget": "under $30"}},
+        )
+        with self.assertRaises(ValueError):
+            QueryHandler("session-4", item)
+
+    def test_modification_switches_fake_to_true_and_corrects_prior_disclosure(self) -> None:
+        item = Item(
+            "ITEM",
+            {},
+            {
+                "browsing": {
+                    "category": "browsing:category",
+                    "material": "browsing:material",
+                    "style": "browsing:style",
+                    "feature": "browsing:feature",
+                },
+                "buying": {
+                    "category": "buying:category",
+                    "material": "buying:material",
+                    "style": "buying:style",
+                    "feature": "buying:feature",
+                },
+            },
+        )
+        modification = Modification(
+            item_id="ITEM",
+            fake_attributes={"material": {"browsing": "fake material", "buying": "fake material"}},
+            modify_turn=3,
+        )
+        handler = QueryHandler("session-mod", item, modification=modification)
+        self.assertIn("material", handler.active_attributes)
+        self.assertEqual(handler.answer("material", turn=1), "fake material")
+        result = handler.answer("category", turn=3)
+        self.assertIn("category", result)
+        self.assertIn("correct", result)
+        self.assertIn("browsing:material", result)
+
+    def test_modification_is_enabled_at_session_level(self) -> None:
+        item = self._item()
+        modification = Modification("ITEM", {"material": {"browsing": "fake", "buying": "fake"}}, 3)
+        sessions = [create_session(f"session-{index}", item, modification) for index in range(100)]
+        enabled = sum(session.modification is not None for session in sessions)
+        self.assertGreater(enabled, 0)
+        self.assertLess(enabled, 100)
+        self.assertEqual(MODIFICATION_SESSION_RATE, 0.30)
+
+    def test_enabled_modification_attributes_are_active(self) -> None:
+        item = self._item()
+        modification = Modification("ITEM", {"other": {"browsing": "fake", "buying": "fake"}}, 3)
+        for index in range(100):
+            session = create_session(f"session-{index}", item, modification)
+            if session.modification is not None:
+                self.assertIn("other", session.query_handler.active_attributes)
 
 
 class SpanVerificationTest(unittest.TestCase):
