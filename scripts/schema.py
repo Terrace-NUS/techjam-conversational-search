@@ -23,4 +23,3 @@ class Modification:
     # attribute -> {"browsing": correction, "buying": correction}; generated correction messages.
     correction_messages: dict[str, dict[str, str]]
     modify_turn: int
-    new_intent: str | None = None
