@@ -255,18 +255,37 @@ class DeepSeekAttributeWriter:
         }
         if budget_context is not None:
             payload["budget_context"] = budget_context
-        response = self.client.chat.completions.create(
-            model=self.model,
-            temperature=0,
-            max_tokens=600,
-            extra_body={"thinking": {"type": "disabled"}},
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-        )
-        return self._parse(response.choices[0].message.content, set(description_attributes))
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        for attempt in range(2):
+            response = self.client.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                max_tokens=600,
+                extra_body={"thinking": {"type": "disabled"}},
+                response_format={"type": "json_object"},
+                messages=messages,
+            )
+            content = response.choices[0].message.content
+            try:
+                return self._parse(content, set(description_attributes))
+            except ValueError:
+                if attempt == 1:
+                    raise
+                messages.append({"role": "assistant", "content": content or ""})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous JSON violated the schema. Regenerate the complete "
+                            "JSON now, with every requested attribute present as a non-empty "
+                            "string in both 'browsing' and 'buying'."
+                        ),
+                    }
+                )
+        raise RuntimeError("unreachable")
 
     def describe_modification(
         self,
@@ -282,20 +301,38 @@ class DeepSeekAttributeWriter:
         }
         if budget_context is not None:
             payload["budget_context"] = budget_context
-        response = self.client.chat.completions.create(
-            model=self.model,
-            temperature=0,
-            max_tokens=700,
-            extra_body={"thinking": {"type": "disabled"}},
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": MODIFICATION_SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-        )
-        return self._parse_modification(
-            response.choices[0].message.content, set(fake_values)
-        )
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": MODIFICATION_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        for attempt in range(2):
+            response = self.client.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                max_tokens=700,
+                extra_body={"thinking": {"type": "disabled"}},
+                response_format={"type": "json_object"},
+                messages=messages,
+            )
+            content = response.choices[0].message.content
+            try:
+                return self._parse_modification(content, set(fake_values))
+            except ValueError:
+                if attempt == 1:
+                    raise
+                messages.append({"role": "assistant", "content": content or ""})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous JSON violated the schema. Regenerate the complete "
+                            "JSON now with both 'fake_descriptions' and 'correction_messages' "
+                            "objects, each containing non-empty 'browsing' and 'buying' text "
+                            "for every requested attribute."
+                        ),
+                    }
+                )
+        raise RuntimeError("unreachable")
 
     @staticmethod
     def _loads(content: str) -> object:

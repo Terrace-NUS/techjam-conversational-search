@@ -84,7 +84,7 @@ def build_modification(
 
     count_rng = random.Random(f"{item_id}:modify_attrs")
     count = min(_choose_fake_attribute_count(count_rng), len(fakeable))
-    chosen = count_rng.sample(fakeable, k=count)
+    chosen = count_rng.sample(fakeable, k=count)[:1]
 
     fake_values: dict[str, str] = {}
     for attribute in chosen:

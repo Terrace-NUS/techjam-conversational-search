@@ -41,6 +41,11 @@ class QueryHandler:
         selected = preferred + rng.sample(remaining, k=ACTIVE_ATTRIBUTE_COUNT - len(preferred))
         self.active_attributes = tuple(selected)
 
+    def _modification_attribute(self) -> str | None:
+        if not self.modification or not self.modification.fake_attributes:
+            return None
+        return next(iter(self.modification.fake_attributes))
+
     def set_intent(self, intent: str) -> None:
         if intent not in INTENTS:
             raise ValueError(f"unknown intent: {intent}")
@@ -52,14 +57,10 @@ class QueryHandler:
         if turn < self.modification.modify_turn:
             return ""
         self.modification_applied = True
-        corrections = []
-        for attribute in self.modification.fake_attributes:
-            if attribute not in self.disclosed_attributes:
-                continue
-            correction = self.modification.correction_messages.get(attribute, {}).get(self.intent)
-            if correction:
-                corrections.append(correction)
-        return " ".join(corrections)
+        attribute = self._modification_attribute()
+        if attribute not in self.disclosed_attributes:
+            return ""
+        return self.modification.correction_messages.get(attribute, {}).get(self.intent, "")
 
     def answer(self, ask_attribute: object, turn: int = 1) -> str | None:
         """Return the current-intent clue for an active attribute and mark it disclosed.
@@ -75,11 +76,12 @@ class QueryHandler:
                 None,
             )
         description = None
+        modification_attribute = self._modification_attribute()
         if attribute in self.active_attributes:
             if (
                 not self.modification_applied
                 and self.modification is not None
-                and attribute in self.modification.fake_attributes
+                and attribute == modification_attribute
             ):
                 description = self.modification.fake_attributes[attribute].get(self.intent)
             else:

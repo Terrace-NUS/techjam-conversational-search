@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-import random
 from dataclasses import dataclass
 
 from .query_handler import QueryHandler
 from .schema import Item, Modification
-
-MODIFICATION_SESSION_RATE = 0.30
-
 
 @dataclass(frozen=True)
 class Session:
@@ -25,13 +21,13 @@ def create_session(
     modification: Modification | None = None,
     initial_intent: str = "browsing",
 ) -> Session:
-    """Select exactly four attributes and enable modification for a deterministic 30% of sessions."""
-    enabled_modification = None
-    if modification is not None:
-        rng = random.Random(f"{session_id}:{item.item_id}:modification")
-        if rng.random() < MODIFICATION_SESSION_RATE:
-            enabled_modification = modification
-    preferred = tuple(enabled_modification.fake_attributes) if enabled_modification else ()
+    """Select attributes and enable the supplied modification."""
+    enabled_modification = modification
+    preferred = (
+        (next(iter(enabled_modification.fake_attributes)),)
+        if enabled_modification and enabled_modification.fake_attributes
+        else ()
+    )
     handler = QueryHandler(
         session_id,
         item,

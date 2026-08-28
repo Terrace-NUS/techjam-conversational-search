@@ -1,0 +1,19 @@
+{
+  "item_id": "B08ZKFD4GM",
+  "attributes": {
+    "category": "Bras Everyday Bras",
+    "brand": "Hanes",
+    "budget": "15_to_30"
+  },
+  "extracted_claims": {
+    "material": null,
+    "color": null,
+    "size": null,
+    "size_options": [],
+    "style": null,
+    "use_case": null,
+    "feature": null,
+    "other": null
+  },
+  "rejected": []
+}

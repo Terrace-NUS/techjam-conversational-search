@@ -10,6 +10,7 @@ from evaluator.local_evaluator import (
     TemplateReplyModel,
     build_reply_model,
     catalog_index,
+    custom_data_index,
     evaluate,
     metric_summary,
     normalize_recommendations,
@@ -28,6 +29,23 @@ class EchoTargetAgent:
         if "B" in user_message:
             asin = "B"
         return {"message": "ok", "ask_attribute": None, "recommendations": [{"parent_asin": asin}]}
+
+
+class ModificationAgent:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def reset(self, session_id: str, user_profile: dict) -> None:
+        pass
+
+    def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
+        self.messages.append(user_message)
+        recommendations = [{"parent_asin": "A"}] if "Correction" in user_message else []
+        return {
+            "message": "ok",
+            "ask_attribute": "style",
+            "recommendations": recommendations,
+        }
 
 
 class EvaluatorTest(unittest.TestCase):
@@ -152,6 +170,52 @@ class EvaluatorTest(unittest.TestCase):
             }]
             result = evaluate(EchoTargetAgent(), samples, catalog_ids, categories, products)
             self.assertEqual(result["hit_rate_at_10"], 1.0)
+
+    def test_custom_override_uses_fake_then_correction_at_modify_turn(self) -> None:
+        catalog_ids = {"A"}
+        categories = {"A": ["Clothing", "Shirts"]}
+        products = {"A": {"parent_asin": "A"}}
+        item_rows = [{
+            "item_id": "A",
+            "features": products["A"],
+            "intent_descriptions": {
+                "browsing": {"style": "browsing true", "material": "cotton", "size": "medium", "color": "blue"},
+                "buying": {"style": "buying true", "material": "cotton", "size": "medium", "color": "blue"},
+            },
+        }]
+        modification_rows = [{
+            "item_id": "A",
+            "fake_attributes": {"style": {"browsing": "fake style", "buying": "fake style"}},
+            "correction_messages": {"style": {"browsing": "Correction: true style", "buying": "Correction: true style"}},
+            "modify_turn": 3,
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            items_path = root / "items.jsonl"
+            modifications_path = root / "modifications.jsonl"
+            items_path.write_text("".join(json.dumps(row) + "\n" for row in item_rows), encoding="utf-8")
+            modifications_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in modification_rows), encoding="utf-8"
+            )
+            items, modifications = custom_data_index(items_path, modifications_path)
+            agent = ModificationAgent()
+            result = evaluate(
+                agent,
+                [{
+                    "sample_id": "override_1",
+                    "scenario_type": "intent_override",
+                    "user_profile": {},
+                    "ground_truth": {"parent_asin": "A"},
+                }],
+                catalog_ids,
+                categories,
+                products,
+                items=items,
+                modifications=modifications,
+            )
+        self.assertEqual(result["hit_rate_at_10"], 1.0)
+        self.assertIn("fake style", agent.messages)
+        self.assertTrue(any("Correction: true style" in message for message in agent.messages))
 
 
 if __name__ == "__main__":

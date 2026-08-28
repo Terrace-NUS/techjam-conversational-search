@@ -16,6 +16,9 @@ from pathlib import Path
 
 from openai import OpenAI
 from starter.agent import Agent, build_agent
+from scripts.query_handler import QueryHandler
+from scripts.schema import Item, Modification
+from scripts.session import create_session
 
 
 MAX_TURNS = 10
@@ -129,6 +132,32 @@ def catalog_index(catalog_path: str | Path) -> tuple[set[str], dict[str, list[st
     return identifiers, categories, products
 
 
+def custom_data_index(
+    items_path: str | Path | None = None,
+    modifications_path: str | Path | None = None,
+) -> tuple[dict[str, Item], dict[str, Modification]]:
+    items: dict[str, Item] = {}
+    modifications: dict[str, Modification] = {}
+    if items_path:
+        for row in load_jsonl(items_path):
+            item = Item(
+                item_id=str(row["item_id"]),
+                features=dict(row.get("features") or {}),
+                intent_descriptions=dict(row.get("intent_descriptions") or {}),
+            )
+            items[item.item_id] = item
+    if modifications_path:
+        for row in load_jsonl(modifications_path):
+            modification = Modification(
+                item_id=str(row["item_id"]),
+                fake_attributes=dict(row.get("fake_attributes") or {}),
+                correction_messages=dict(row.get("correction_messages") or {}),
+                modify_turn=int(row["modify_turn"]),
+            )
+            modifications[modification.item_id] = modification
+    return items, modifications
+
+
 def coarse_category(values: list[str]) -> str:
     excluded = {"clothing", "clothing shoes & jewelry", "clothing, shoes & jewelry"}
     cleaned: list[str] = []
@@ -212,6 +241,10 @@ class ReplyModel(ABC):
     def override_message(self, override: dict) -> str:
         raise NotImplementedError
 
+    @abstractmethod
+    def rewrite_query_answer(self, canonical_message: str) -> str:
+        raise NotImplementedError
+
 
 class TemplateReplyModel(ReplyModel):
     """The official deterministic wording used by the local evaluator."""
@@ -230,6 +263,9 @@ class TemplateReplyModel(ReplyModel):
 
     def override_message(self, override: dict) -> str:
         return str(override.get("message", "Actually, please ignore my earlier preference."))
+
+    def rewrite_query_answer(self, canonical_message: str) -> str:
+        return canonical_message
 
 
 class DeepSeekReplyModel(ReplyModel):
@@ -345,6 +381,9 @@ class DeepSeekReplyModel(ReplyModel):
     def override_message(self, override: dict) -> str:
         canonical = self.template.override_message(override)
         return self._rewrite(canonical, "intent-override customer reply")
+
+    def rewrite_query_answer(self, canonical_message: str) -> str:
+        return self._rewrite(canonical_message, "follow-up customer reply")
 
     def _rewrite(self, canonical: str, reply_type: str) -> str:
         response = self.client.chat.completions.create(
@@ -467,6 +506,8 @@ def _evaluate_sample(
     products: dict[str, dict],
     reply_model: ReplyModel,
     agent_lock: threading.Lock,
+    items: dict[str, Item] | None = None,
+    modifications: dict[str, Modification] | None = None,
 ) -> tuple[dict, int, int]:
     session_id = f"public_{uuid.uuid4().hex}"
     with agent_lock:
@@ -476,10 +517,30 @@ def _evaluate_sample(
     effective_sample = {**sample, "intent_card": effective_intent_card, "behavior": effective_behavior}
     disclosed: set[str] = set()
     boundary_used = False
-    override_applied = sample["scenario_type"] != "intent_override"
+    query_handler: QueryHandler | None = None
+    custom_item = (items or {}).get(target)
+    custom_modification = (modifications or {}).get(target)
+    custom_override = (
+        sample["scenario_type"] == "intent_override"
+        and custom_item is not None
+        and custom_modification is not None
+    )
+    if custom_item is not None:
+        try:
+            initial_intent = "buying" if sample["scenario_type"] == "buying" else "browsing"
+            session = create_session(
+                str(sample["sample_id"]),
+                custom_item,
+                custom_modification if custom_override else None,
+                initial_intent=initial_intent,
+            )
+            query_handler = session.query_handler
+        except (KeyError, TypeError, ValueError):
+            query_handler = None
     user_message = reply_model.initial_message(
         effective_sample, coarse_category(categories.get(target, [])), disclosed
     )
+    override_applied = sample["scenario_type"] != "intent_override"
     prompt_tokens = 0
     completion_tokens = 0
     hit_turn: int | None = None
@@ -506,12 +567,39 @@ def _evaluate_sample(
         if turn == MAX_TURNS:
             break
         override = effective_sample.get("behavior", {}).get("override") or {}
-        if not override_applied and turn + 1 == int(override.get("turn", 3)):
+        if not override_applied and custom_override:
+            if turn + 1 >= custom_modification.modify_turn:
+                canonical_message = query_handler.answer(response.get("ask_attribute"), turn + 1)
+                override_applied = True
+                user_message = reply_model.rewrite_query_answer(
+                    canonical_message or "I have updated my preferences."
+                )
+            else:
+                canonical_message = query_handler.answer(response.get("ask_attribute"), turn + 1)
+                user_message = reply_model.rewrite_query_answer(
+                    canonical_message or "I don't have an additional preference for that."
+                )
+        elif not override_applied and turn + 1 == int(override.get("turn", 3)):
             override_applied = True
             new_value = str(override.get("new_value", ""))
             if new_value:
                 disclosed.add(new_value)
+            if query_handler is not None:
+                query_handler.set_intent("buying")
             user_message = reply_model.override_message(override)
+        elif query_handler is not None:
+            if sample["scenario_type"] == "boundary" and not boundary_used:
+                attribute = response.get("ask_attribute")
+                if isinstance(attribute, str) and attribute:
+                    user_message = f"I don't have a preference for {attribute}; please use your judgment."
+                    boundary_used = True
+                else:
+                    user_message = "Those options are not quite right yet. Ask me about one specific attribute."
+            else:
+                canonical_message = query_handler.answer(response.get("ask_attribute"), turn + 1)
+                user_message = reply_model.rewrite_query_answer(
+                    canonical_message or "I don't have an additional preference for that."
+                )
         else:
             user_message, boundary_used = reply_model.customer_reply(
                 effective_sample, response.get("ask_attribute"), disclosed, boundary_used
@@ -540,6 +628,8 @@ def evaluate(
     checkpoint_path: str | Path | None = None,
     progress: bool = False,
     max_workers: int = 1,
+    items: dict[str, Item] | None = None,
+    modifications: dict[str, Modification] | None = None,
 ) -> dict:
     reply_model = reply_model or TemplateReplyModel()
     if max_workers < 1:
@@ -557,6 +647,8 @@ def evaluate(
         products,
         reply_model,
         agent_lock,
+        items,
+        modifications,
     )
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -597,6 +689,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="TechJam public-set local evaluator")
     parser.add_argument("--catalog", default="data/catalog.jsonl")
     parser.add_argument("--dataset", default="data/public_set.jsonl")
+    parser.add_argument("--items", default=None, help="Optional custom items.jsonl simulator data.")
+    parser.add_argument(
+        "--modifications", default=None, help="Optional custom modifications.jsonl simulator data."
+    )
     parser.add_argument("--output", default="results.json")
     parser.add_argument(
         "--agent",
@@ -629,6 +725,7 @@ def main() -> None:
     args = parser.parse_args()
     samples = load_jsonl(args.dataset)
     catalog_ids, categories, products = catalog_index(args.catalog)
+    items, modifications = custom_data_index(args.items, args.modifications)
     result = evaluate(
         build_agent(args.agent, args.catalog),
         samples,
@@ -639,6 +736,8 @@ def main() -> None:
         checkpoint_path=args.checkpoint or f"{args.output}.partial",
         progress=args.progress,
         max_workers=args.workers,
+        items=items,
+        modifications=modifications,
     )
     Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: value for key, value in result.items() if key != "sessions"}, indent=2))

@@ -1,0 +1,18 @@
+{
+  "fake_descriptions": {
+    "browsing": {
+      "budget": "maybe under 60"
+    },
+    "buying": {
+      "budget": "around 35"
+    }
+  },
+  "correction_messages": {
+    "browsing": {
+      "budget": "Actually, I meant under 30."
+    },
+    "buying": {
+      "budget": "Sorry, I meant 15 to 30."
+    }
+  }
+}

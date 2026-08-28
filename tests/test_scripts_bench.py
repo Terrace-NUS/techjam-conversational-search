@@ -14,7 +14,7 @@ from scripts.attributes import (
 from scripts.llm_client import DeepSeekAttributeWriter, cached_json_call
 from scripts.modification import _conflicts_with_truth, build_modification
 from scripts.query_handler import ACTIVE_ATTRIBUTE_COUNT, QueryHandler
-from scripts.session import MODIFICATION_SESSION_RATE, create_session
+from scripts.session import create_session
 from scripts.schema import Item
 from scripts.schema import Modification
 
@@ -162,7 +162,7 @@ class QueryHandlerTest(unittest.TestCase):
         self.assertIn("correct", result)
         self.assertIn("correction text", result)
 
-    def test_modification_is_enabled_at_session_level(self) -> None:
+    def test_modification_is_enabled_when_supplied(self) -> None:
         item = self._item()
         modification = Modification(
             "ITEM",
@@ -172,9 +172,7 @@ class QueryHandlerTest(unittest.TestCase):
         )
         sessions = [create_session(f"session-{index}", item, modification) for index in range(100)]
         enabled = sum(session.modification is not None for session in sessions)
-        self.assertGreater(enabled, 0)
-        self.assertLess(enabled, 100)
-        self.assertEqual(MODIFICATION_SESSION_RATE, 0.30)
+        self.assertEqual(enabled, 100)
 
     def test_enabled_modification_attributes_are_active(self) -> None:
         item = self._item()
@@ -186,8 +184,8 @@ class QueryHandlerTest(unittest.TestCase):
         )
         for index in range(100):
             session = create_session(f"session-{index}", item, modification)
-            if session.modification is not None:
-                self.assertIn("other", session.query_handler.active_attributes)
+            self.assertIsNotNone(session.modification)
+            self.assertIn("other", session.query_handler.active_attributes)
 
 
 class SpanVerificationTest(unittest.TestCase):
