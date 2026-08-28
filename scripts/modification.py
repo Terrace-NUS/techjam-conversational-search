@@ -102,18 +102,34 @@ def build_modification(
         budget_context = {"exact_price": exact_price, "browsing_ceiling": browsing_budget_ceiling(exact_price)}
 
     cache_path = cache_dir / f"{item_id}.json"
-    fake_descriptions = cached_json_call(
-        cache_path, lambda: writer.describe(category, fake_values, budget_context)
+    generated = cached_json_call(
+        cache_path,
+        lambda: writer.describe_modification(
+            category, fake_values, true_attributes, budget_context
+        ),
     )
+    fake_descriptions = generated["fake_descriptions"]
+    correction_messages = generated["correction_messages"]
     fake_attributes = {
         attribute: {
-            "browsing": fake_descriptions["browsing"][attribute],
-            "buying": fake_descriptions["buying"][attribute],
+            stage: fake_descriptions[stage][attribute]
+            for stage in ("browsing", "buying")
         }
         for attribute in fake_values
     }
 
     turn_rng = random.Random(f"{item_id}:modify_turn")
     modify_turn = turn_rng.choice(MODIFY_TURN_CHOICES)
-    return Modification(item_id=item_id, fake_attributes=fake_attributes, modify_turn=modify_turn)
+    return Modification(
+        item_id=item_id,
+        fake_attributes=fake_attributes,
+        correction_messages={
+            attribute: {
+                stage: correction_messages[stage][attribute]
+                for stage in ("browsing", "buying")
+            }
+            for attribute in fake_values
+        },
+        modify_turn=modify_turn,
+    )
 

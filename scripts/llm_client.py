@@ -86,6 +86,17 @@ SYSTEM_PROMPT = (
     '{"browsing": {"<attribute>": "..."}, "buying": {"<attribute>": "..."}}.'
 )
 
+MODIFICATION_SYSTEM_PROMPT = (
+    "You generate deterministic customer-language data for a shopping benchmark. "
+    "For each requested attribute, return two intent stages, browsing and buying. "
+    "At each stage, fake_description must express the supplied fake value naturally. "
+    "correction_message must be a natural customer message correcting an earlier "
+    "wrong answer and stating the supplied true value. Do not invent facts, do not "
+    "mention hidden state or ASINs, and return JSON only in this exact shape: "
+    '{"fake_descriptions":{"browsing":{"attribute":"..."},"buying":{"attribute":"..."}},'
+    '"correction_messages":{"browsing":{"attribute":"..."},"buying":{"attribute":"..."}}}'
+)
+
 
 def _load_dotenv(path: str | Path = ".env") -> None:
     """Load simple KEY=VALUE entries without adding a dotenv dependency."""
@@ -236,6 +247,35 @@ class DeepSeekAttributeWriter:
         )
         return self._parse(response.choices[0].message.content, set(description_attributes))
 
+    def describe_modification(
+        self,
+        category: str,
+        fake_values: dict[str, str],
+        true_values: dict[str, str],
+        budget_context: dict[str, float] | None = None,
+    ) -> dict[str, dict[str, dict[str, str]]]:
+        payload: dict[str, object] = {
+            "category": category,
+            "fake_values": fake_values,
+            "true_values": {attribute: true_values[attribute] for attribute in fake_values},
+        }
+        if budget_context is not None:
+            payload["budget_context"] = budget_context
+        response = self.client.chat.completions.create(
+            model=self.model,
+            temperature=0,
+            max_tokens=700,
+            extra_body={"thinking": {"type": "disabled"}},
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": MODIFICATION_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+        )
+        return self._parse_modification(
+            response.choices[0].message.content, set(fake_values)
+        )
+
     @staticmethod
     def _loads(content: str) -> object:
         """Parse a JSON body that may arrive fenced or wrapped in prose."""
@@ -276,4 +316,33 @@ class DeepSeekAttributeWriter:
                     raise ValueError(f"DeepSeek response missing text for '{stage}.{attribute}'")
                 cleaned[attribute] = text_value.strip()
             result[stage] = cleaned
+        return result
+
+    @staticmethod
+    def _parse_modification(
+        content: object, expected_attributes: set[str]
+    ) -> dict[str, dict[str, dict[str, str]]]:
+        if not isinstance(content, str):
+            raise ValueError("DeepSeek response content must be a string")
+        parsed = DeepSeekAttributeWriter._loads(content)
+        if not isinstance(parsed, dict):
+            raise ValueError("DeepSeek modification response must be a JSON object")
+        result: dict[str, dict[str, dict[str, str]]] = {}
+        for group in ("fake_descriptions", "correction_messages"):
+            stages = parsed.get(group)
+            if not isinstance(stages, dict):
+                raise ValueError(f"DeepSeek modification response missing '{group}'")
+            result[group] = {}
+            for stage in ("browsing", "buying"):
+                values = stages.get(stage)
+                if not isinstance(values, dict):
+                    raise ValueError(f"DeepSeek modification response missing '{group}.{stage}'")
+                result[group][stage] = {}
+                for attribute in expected_attributes:
+                    value = values.get(attribute)
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError(
+                            f"DeepSeek modification response missing '{group}.{stage}.{attribute}'"
+                        )
+                    result[group][stage][attribute] = value.strip()
         return result

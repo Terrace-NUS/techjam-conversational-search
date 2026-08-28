@@ -54,6 +54,29 @@ class FakeWriter:
             "buying": {attribute: f"clear:{value}" for attribute, value in attribute_values.items()},
         }
 
+    def describe_modification(
+        self,
+        category: str,
+        fake_values: dict[str, str],
+        true_values: dict[str, str],
+        budget_context: dict | None = None,
+    ) -> dict:
+        self.calls += 1
+        self.last_budget_context = budget_context
+        return {
+            "fake_descriptions": {
+                stage: {attribute: f"fake:{value}" for attribute, value in fake_values.items()}
+                for stage in ("browsing", "buying")
+            },
+            "correction_messages": {
+                stage: {
+                    attribute: f"correction:{true_values[attribute]}"
+                    for attribute in fake_values
+                }
+                for stage in ("browsing", "buying")
+            },
+        }
+
 
 class PriceBandTest(unittest.TestCase):
     def test_price_band_boundaries(self) -> None:
@@ -128,6 +151,7 @@ class QueryHandlerTest(unittest.TestCase):
         modification = Modification(
             item_id="ITEM",
             fake_attributes={"material": {"browsing": "fake material", "buying": "fake material"}},
+            correction_messages={"material": {"browsing": "correction text", "buying": "correction text"}},
             modify_turn=3,
         )
         handler = QueryHandler("session-mod", item, modification=modification)
@@ -136,11 +160,16 @@ class QueryHandlerTest(unittest.TestCase):
         result = handler.answer("category", turn=3)
         self.assertIn("category", result)
         self.assertIn("correct", result)
-        self.assertIn("browsing:material", result)
+        self.assertIn("correction text", result)
 
     def test_modification_is_enabled_at_session_level(self) -> None:
         item = self._item()
-        modification = Modification("ITEM", {"material": {"browsing": "fake", "buying": "fake"}}, 3)
+        modification = Modification(
+            "ITEM",
+            {"material": {"browsing": "fake", "buying": "fake"}},
+            {"material": {"browsing": "correction", "buying": "correction"}},
+            3,
+        )
         sessions = [create_session(f"session-{index}", item, modification) for index in range(100)]
         enabled = sum(session.modification is not None for session in sessions)
         self.assertGreater(enabled, 0)
@@ -149,7 +178,12 @@ class QueryHandlerTest(unittest.TestCase):
 
     def test_enabled_modification_attributes_are_active(self) -> None:
         item = self._item()
-        modification = Modification("ITEM", {"other": {"browsing": "fake", "buying": "fake"}}, 3)
+        modification = Modification(
+            "ITEM",
+            {"other": {"browsing": "fake", "buying": "fake"}},
+            {"other": {"browsing": "correction", "buying": "correction"}},
+            3,
+        )
         for index in range(100):
             session = create_session(f"session-{index}", item, modification)
             if session.modification is not None:
@@ -287,6 +321,7 @@ class FakeValueTest(unittest.TestCase):
             self.assertIsNotNone(modification)
             if "material" in modification.fake_attributes:
                 self.assertNotIn("polyester and mesh", modification.fake_attributes["material"]["browsing"])
+            self.assertEqual(set(modification.correction_messages), set(modification.fake_attributes))
 
 
 class ModificationTest(unittest.TestCase):
@@ -300,6 +335,7 @@ class ModificationTest(unittest.TestCase):
             self.assertIsNotNone(first)
             self.assertEqual(first, second)
             self.assertIn(first.modify_turn, (3, 4))
+            self.assertEqual(first.correction_messages, second.correction_messages)
 
     def test_build_modification_fake_values_differ_from_truth(self) -> None:
         with TemporaryDirectory() as directory:

@@ -20,5 +20,7 @@ class Modification:
     item_id: str
     # attribute -> {"browsing": text, "buying": text}; fake values, disjoint from Item.intent_descriptions.
     fake_attributes: dict[str, dict[str, str]]
+    # attribute -> {"browsing": correction, "buying": correction}; generated correction messages.
+    correction_messages: dict[str, dict[str, str]]
     modify_turn: int
     new_intent: str | None = None

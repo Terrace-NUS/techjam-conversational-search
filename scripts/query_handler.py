@@ -56,9 +56,9 @@ class QueryHandler:
         for attribute in self.modification.fake_attributes:
             if attribute not in self.disclosed_attributes:
                 continue
-            true_description = self.item.intent_descriptions.get(self.intent, {}).get(attribute)
-            if true_description:
-                corrections.append(f"For {attribute}, I need to correct what I said earlier: {true_description}")
+            correction = self.modification.correction_messages.get(attribute, {}).get(self.intent)
+            if correction:
+                corrections.append(correction)
         return " ".join(corrections)
 
     def answer(self, ask_attribute: object, turn: int = 1) -> str | None:
