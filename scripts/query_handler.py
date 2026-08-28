@@ -66,15 +66,10 @@ class QueryHandler:
         """Return the current-intent clue for an active attribute and mark it disclosed.
 
         A direct request for an inactive attribute is intentionally unanswered. The
-        open ``other`` slot reveals at most one still-hidden active attribute.
+        ``other`` attribute is handled like every other active attribute.
         """
         correction = self._apply_modification(turn)
         attribute = ask_attribute if isinstance(ask_attribute, str) else None
-        if attribute == "other":
-            attribute = next(
-                (name for name in self.active_attributes if name not in self.disclosed_attributes),
-                None,
-            )
         description = None
         modification_attribute = self._modification_attribute()
         if attribute in self.active_attributes:

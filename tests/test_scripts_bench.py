@@ -106,14 +106,24 @@ class QueryHandlerTest(unittest.TestCase):
         self.assertEqual(first.active_attributes, second.active_attributes)
         self.assertEqual(len(first.active_attributes), ACTIVE_ATTRIBUTE_COUNT)
 
-    def test_other_reveals_only_one_active_attribute_at_a_time(self) -> None:
+    def test_active_other_returns_only_other_description(self) -> None:
         handler = QueryHandler("session-2", self._item())
-        first = handler.answer("other")
-        self.assertIsNotNone(first)
+        handler.active_attributes = (*handler.active_attributes[:-1], "other")
+        result = handler.answer("other")
+        self.assertEqual(result, "browsing:other")
         self.assertEqual(len(handler.disclosed_attributes), 1)
-        second = handler.answer("other")
-        self.assertIsNotNone(second)
-        self.assertEqual(len(handler.disclosed_attributes), 2)
+
+    def test_inactive_other_does_not_reveal_another_attribute(self) -> None:
+        handler = next(
+            QueryHandler(f"session-inactive-other-{index}", self._item())
+            for index in range(100)
+            if "other" not in QueryHandler(
+                f"session-inactive-other-{index}", self._item()
+            ).active_attributes
+        )
+        self.assertNotIn("other", handler.active_attributes)
+        self.assertIsNone(handler.answer("other"))
+        self.assertEqual(handler.disclosed_attributes, set())
 
     def test_inactive_attribute_is_not_revealed(self) -> None:
         handler = QueryHandler("session-3", self._item())

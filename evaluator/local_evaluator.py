@@ -192,6 +192,21 @@ def custom_data_index(
     return items, modifications
 
 
+def custom_intent_card(item: Item, intent: str, fallback_category: str) -> dict:
+    descriptions = item.intent_descriptions.get(intent, {})
+    category = str(descriptions.get("category") or fallback_category)
+    constraints = [
+        str(value)
+        for attribute, value in descriptions.items()
+        if attribute != "category" and value not in (None, "")
+    ]
+    return {
+        "target_category": category,
+        "hard_constraints": constraints[:2],
+        "soft_preferences": constraints[2:4] or constraints[:1],
+    }
+
+
 def coarse_category(values: list[str]) -> str:
     excluded = {"clothing", "clothing shoes & jewelry", "clothing, shoes & jewelry"}
     cleaned: list[str] = []
@@ -222,13 +237,12 @@ def classify_constraint(value: str) -> str:
 
 def initial_message(sample: dict, category: str, disclosed: set[str]) -> str:
     intent = sample_intent(sample)
+    if sample_has_override(sample):
+        return f"I'm looking for {category}, but I'm still exploring."
     if intent == "buying" and sample["intent_card"].get("hard_constraints"):
         constraint = str(sample["intent_card"]["hard_constraints"][0])
         disclosed.add(constraint)
         return f"I'm looking for {category}. A key requirement is: {constraint}."
-    if sample_has_override(sample):
-        old_value = str(sample["behavior"]["override"]["old_value"])
-        return f"I'm looking for {category}. {old_value}"
     return f"I'm looking for {category}, but I'm still exploring."
 
 
@@ -506,6 +520,7 @@ def _evaluation_result(sessions: list[dict], prompt_tokens: int, completion_toke
     grouped: dict[str, list[dict]] = defaultdict(list)
     for session in sessions:
         grouped[session["scenario_type"]].append(session)
+    override_sessions = [session for session in sessions if session.get("override")]
     return {
         **overall,
         "efficiency": round(efficiency, 6),
@@ -516,6 +531,7 @@ def _evaluation_result(sessions: list[dict], prompt_tokens: int, completion_toke
             "total_tokens": prompt_tokens + completion_tokens,
         },
         "scenario_metrics": {name: metric_summary(grouped[name]) for name in sorted(grouped)},
+        "override_metrics": metric_summary(override_sessions),
         "sessions": sessions,
     }
 
@@ -560,6 +576,21 @@ def _evaluate_sample(
         and custom_item is not None
         and custom_modification is not None
     )
+    fallback_category = coarse_category(categories.get(target, []))
+    if custom_item is not None:
+        custom_intent = sample_intent(sample)
+        effective_intent_card = custom_intent_card(custom_item, custom_intent, fallback_category)
+        seed_source = f"{sample.get('sample_id', '')}\0{sample.get('scenario_type', '')}"
+        effective_behavior = behavior_for(
+            "intent_override" if sample_has_override(sample) else custom_intent,
+            effective_intent_card,
+            random.Random(seed_source),
+        )
+        effective_sample = {
+            **sample,
+            "intent_card": effective_intent_card,
+            "behavior": effective_behavior,
+        }
     if custom_item is not None:
         try:
             initial_intent = sample_intent(sample)
@@ -573,7 +604,9 @@ def _evaluate_sample(
         except (KeyError, TypeError, ValueError):
             query_handler = None
     user_message = reply_model.initial_message(
-        effective_sample, coarse_category(categories.get(target, [])), disclosed
+        effective_sample,
+        str(effective_intent_card.get("target_category") or fallback_category),
+        disclosed,
     )
     override_applied = not sample_has_override(sample)
     prompt_tokens = 0
