@@ -2,15 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .attributes import browsing_budget_ceiling, extract_attributes, item_category
+from .attributes import browsing_budget_ceiling, item_category
 from .llm_client import DeepSeekAttributeWriter, cached_json_call
 from .schema import Item
 
 
-def build_item(product: dict, writer: DeepSeekAttributeWriter, cache_dir: Path) -> Item:
+def build_item(
+    product: dict, attributes: dict[str, str], writer: DeepSeekAttributeWriter, cache_dir: Path
+) -> Item:
     """Build the true-value Item record (paraphrased browsing/buying clues) for one product."""
     item_id = str(product["parent_asin"])
-    attributes = extract_attributes(product)
     category = item_category(product)
 
     budget_context = None

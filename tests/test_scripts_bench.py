@@ -5,9 +5,14 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from scripts.attributes import browsing_budget_ceiling, extract_attributes, price_band
+from scripts.attributes import (
+    browsing_budget_ceiling,
+    derived_attributes,
+    price_band,
+    verify_extraction,
+)
 from scripts.llm_client import DeepSeekAttributeWriter, cached_json_call
-from scripts.modification import build_modification
+from scripts.modification import _conflicts_with_truth, build_modification
 
 SAMPLE_PRODUCT = {
     "parent_asin": "B0TESTITEM1",
@@ -21,6 +26,8 @@ SAMPLE_PRODUCT = {
 }
 
 SAMPLE_CATEGORY = "Men Shirts"
+
+SAMPLE_ATTRIBUTES = derived_attributes(SAMPLE_PRODUCT)
 
 
 class FakeWriter:
@@ -44,34 +51,7 @@ class FakeWriter:
         }
 
 
-class AttributeExtractionTest(unittest.TestCase):
-    def test_extract_attributes_grounds_expected_fields(self) -> None:
-        attributes = extract_attributes(SAMPLE_PRODUCT)
-        self.assertEqual(attributes["material"], "cotton")
-        self.assertEqual(attributes["brand"], "Acme Apparel")
-        self.assertEqual(attributes["budget"], "15_to_30")
-        self.assertIn("category", attributes)
-
-    def test_extract_attributes_joins_multiple_matches(self) -> None:
-        product = {**SAMPLE_PRODUCT, "features": ["Cotton, Polyester, Spandex blend"]}
-        attributes = extract_attributes(product)
-        self.assertEqual(attributes["material"], "cotton, polyester, and spandex")
-
-    def test_extract_attributes_ignores_prohibited_use_cases(self) -> None:
-        product = {
-            **SAMPLE_PRODUCT,
-            "features": ["Perfect for hiking and outdoor activities."],
-            "description": ["Do not wear while swimming or bathing."],
-        }
-        attributes = extract_attributes(product)
-        self.assertIn("Perfect for hiking and outdoor activities.", attributes["use_case"])
-        self.assertIn("Do not wear while swimming or bathing.", attributes["use_case"])
-
-    def test_extract_attributes_preserves_all_sizes(self) -> None:
-        product = {**SAMPLE_PRODUCT, "features": ["Available in small, medium, large, and XL sizes."]}
-        attributes = extract_attributes(product)
-        self.assertEqual(attributes["size"], "small, medium, large, and xl")
-
+class PriceBandTest(unittest.TestCase):
     def test_price_band_boundaries(self) -> None:
         self.assertEqual(price_band(10), "under_15")
         self.assertEqual(price_band(15), "15_to_30")
@@ -83,14 +63,147 @@ class AttributeExtractionTest(unittest.TestCase):
         self.assertGreater(ceiling, 36.5)
 
 
+class SpanVerificationTest(unittest.TestCase):
+    """The gates that make a model-extracted value trustworthy enough to score against."""
+
+    NECKLACE = {
+        "parent_asin": "B0TESTNECK1",
+        "title": "Pendant Necklace",
+        "features": ["Material:alloy"],
+        "description": ["5.it is not real gold and silver products and It will fade away slowly"],
+        "price": 9.99,
+        "categories": ["Clothing, Shoes & Jewelry", "Jewelry", "Necklaces"],
+        "details": {},
+        "store": "QIAN0813",
+    }
+
+    def test_verified_claim_is_kept(self) -> None:
+        verified, rejected = verify_extraction(
+            self.NECKLACE, {"material": {"value": "alloy", "evidence": "Material:alloy"}}
+        )
+        self.assertEqual(verified["material"], "alloy")
+        self.assertEqual(rejected, [])
+
+    def test_verified_other_claim_is_kept(self) -> None:
+        verified, rejected = verify_extraction(
+            self.NECKLACE,
+            {"other": {"value": "pendant necklace", "evidence": "Pendant Necklace"}},
+        )
+        self.assertEqual(verified["other"], "pendant necklace")
+        self.assertEqual(rejected, [])
+
+    def test_verified_size_options_are_kept_for_description_generation(self) -> None:
+        verified, rejected = verify_extraction(
+            self.NECKLACE,
+            {"size": None, "size_options": ["S", "M", "XL"]},
+        )
+        self.assertEqual(verified["size_options"], "S, M, XL")
+        self.assertNotIn("size", verified)
+
+    def test_invented_evidence_is_rejected(self) -> None:
+        verified, rejected = verify_extraction(
+            self.NECKLACE,
+            {"use_case": {"value": "not for swimming", "evidence": "Do not wear while swimming."}},
+        )
+        self.assertNotIn("use_case", verified)
+        self.assertIn("evidence not found", rejected[0])
+
+    def test_use_case_negation_is_preserved(self) -> None:
+        product = {
+            **self.NECKLACE,
+            "description": ["Do not wear while swimming."],
+        }
+        verified, rejected = verify_extraction(
+            product,
+            {"use_case": {"value": "do not wear while swimming", "evidence": "Do not wear while swimming."}},
+        )
+        self.assertEqual(verified["use_case"], "do not wear while swimming")
+        self.assertEqual(rejected, [])
+
+    def test_negated_evidence_is_rejected(self) -> None:
+        # The quote is verbatim, so a substring check alone would accept it.
+        verified, rejected = verify_extraction(
+            self.NECKLACE,
+            {
+                "material": {
+                    "value": "gold and silver",
+                    "evidence": "it is not real gold and silver products",
+                }
+            },
+        )
+        self.assertNotIn("material", verified)
+        self.assertIn("negated", rejected[0])
+
+    def test_value_unsupported_by_its_evidence_is_rejected(self) -> None:
+        verified, rejected = verify_extraction(
+            self.NECKLACE, {"color": {"value": "turquoise", "evidence": "Material:alloy"}}
+        )
+        self.assertNotIn("color", verified)
+        self.assertIn("not supported", rejected[0])
+
+    def test_missing_claim_is_silently_absent(self) -> None:
+        verified, rejected = verify_extraction(self.NECKLACE, {"color": None})
+        self.assertEqual(verified, {})
+        self.assertEqual(rejected, [])
+
+    def test_size_is_dropped_when_the_listing_stocks_a_range(self) -> None:
+        product = {**self.NECKLACE, "features": ["Available in XL"]}
+        verified, rejected = verify_extraction(
+            product,
+            {
+                "size": {"value": "XL", "evidence": "Available in XL"},
+                "size_options": ["S", "M", "L", "XL"],
+            },
+        )
+        self.assertNotIn("size", verified)
+        self.assertIn("stocks 4 sizes", rejected[0])
+
+    def test_evidence_may_be_reflowed_but_not_reworded(self) -> None:
+        verified, _ = verify_extraction(
+            self.NECKLACE, {"material": {"value": "alloy", "evidence": "Material: alloy"}}
+        )
+        self.assertEqual(verified["material"], "alloy")
+
+    def test_combined_evidence_spans_are_rejected(self) -> None:
+        verified, rejected = verify_extraction(
+            self.NECKLACE,
+            {
+                "feature": {
+                    "value": "alloy and pendant",
+                    "evidence": "Material:alloy; Pendant Necklace",
+                }
+            },
+        )
+        self.assertNotIn("feature", verified)
+        self.assertIn("evidence not found", rejected[0])
+
+
+class FakeValueTest(unittest.TestCase):
+    def test_fake_value_may_not_overlap_the_true_value(self) -> None:
+        # "mesh" describes an item whose true material is "polyester and mesh", so it
+        # is not a modification at all — the agent's original answer stays correct.
+        self.assertTrue(_conflicts_with_truth("mesh", "polyester and mesh"))
+        self.assertFalse(_conflicts_with_truth("linen", "polyester and mesh"))
+
+    def test_build_modification_fakes_do_not_restate_the_truth(self) -> None:
+        attributes = {**SAMPLE_ATTRIBUTES, "material": "polyester and mesh"}
+        with TemporaryDirectory() as directory:
+            modification = build_modification(
+                SAMPLE_PRODUCT, "B0TESTITEM1", attributes, FakeWriter(), Path(directory)
+            )
+            self.assertIsNotNone(modification)
+            if "material" in modification.fake_attributes:
+                self.assertNotIn("polyester and mesh", modification.fake_attributes["material"]["browsing"])
+
+
 class ModificationTest(unittest.TestCase):
     def test_build_modification_is_deterministic(self) -> None:
         with TemporaryDirectory() as directory:
             cache_dir = Path(directory)
             writer_a = FakeWriter()
             writer_b = FakeWriter()
-            first = build_modification(SAMPLE_PRODUCT, "B0TESTITEM1", writer_a, cache_dir / "a", {})
-            second = build_modification(SAMPLE_PRODUCT, "B0TESTITEM1", writer_b, cache_dir / "b", {})
+            first = build_modification(SAMPLE_PRODUCT, "B0TESTITEM1", SAMPLE_ATTRIBUTES, writer_a, cache_dir / "a")
+            second = build_modification(SAMPLE_PRODUCT, "B0TESTITEM1", SAMPLE_ATTRIBUTES, writer_b, cache_dir / "b")
             self.assertIsNotNone(first)
             self.assertEqual(first, second)
             self.assertIn(first.modify_turn, (3, 4))
@@ -98,7 +211,7 @@ class ModificationTest(unittest.TestCase):
     def test_build_modification_fake_values_differ_from_truth(self) -> None:
         with TemporaryDirectory() as directory:
             modification = build_modification(
-                SAMPLE_PRODUCT, "B0TESTITEM1", FakeWriter(), Path(directory), {}
+                SAMPLE_PRODUCT, "B0TESTITEM1", SAMPLE_ATTRIBUTES, FakeWriter(), Path(directory)
             )
             self.assertIsNotNone(modification)
             for attribute, texts in modification.fake_attributes.items():
@@ -106,24 +219,11 @@ class ModificationTest(unittest.TestCase):
                 self.assertTrue(texts["browsing"])
                 self.assertTrue(texts["buying"])
 
-    def test_build_modification_prefers_category_vocab_over_global_fallback(self) -> None:
-        category_vocab = {SAMPLE_CATEGORY: {"material": ["linen"]}}
-        with TemporaryDirectory() as directory:
-            modification = build_modification(
-                SAMPLE_PRODUCT, "B0TESTITEM1", FakeWriter(), Path(directory), category_vocab
-            )
-            self.assertIsNotNone(modification)
-            if "material" in modification.fake_attributes:
-                # The fake material must come from the category-observed vocabulary (only "linen"
-                # here), not an arbitrary global material such as "wool".
-                self.assertIn("linen", modification.fake_attributes["material"]["browsing"])
-
     def test_build_modification_passes_numeric_budget_context_for_fake_budget(self) -> None:
-        category_vocab: dict = {}
         with TemporaryDirectory() as directory:
             writer = FakeWriter()
             modification = build_modification(
-                SAMPLE_PRODUCT, "B0TESTITEM1", writer, Path(directory), category_vocab
+                SAMPLE_PRODUCT, "B0TESTITEM1", SAMPLE_ATTRIBUTES, writer, Path(directory)
             )
             self.assertIsNotNone(modification)
             if "budget" in modification.fake_attributes:
@@ -162,14 +262,55 @@ class DeepSeekAttributeWriterTest(unittest.TestCase):
                 os.environ["DEEPSEEK_API_KEY"] = original
 
     def test_parse_requires_both_stages_and_attributes(self) -> None:
-        valid = json.dumps({"browsing": {"material": "soft-ish"}, "buying": {"material": "cotton blend"}})
-        parsed = DeepSeekAttributeWriter._parse(valid, {"material"})
+        valid = json.dumps({"browsing": {"material": "soft-ish", "feature": "stretch"}, "buying": {"material": "cotton blend", "feature": "stretchy"}})
+        parsed = DeepSeekAttributeWriter._parse(valid, {"material", "feature"})
         self.assertEqual(parsed["browsing"]["material"], "soft-ish")
 
         with self.assertRaises(ValueError):
             DeepSeekAttributeWriter._parse(json.dumps({"browsing": {"material": "x"}}), {"material"})
         with self.assertRaises(ValueError):
             DeepSeekAttributeWriter._parse("not json", {"material"})
+
+    def test_validate_extraction_shape_rejects_bare_attribute_strings(self) -> None:
+        invalid = {
+            "material": "Stainless Steel",
+            "color": None,
+            "size": None,
+            "size_options": [],
+            "style": None,
+            "use_case": None,
+            "feature": None,
+            "other": None,
+        }
+        with self.assertRaises(ValueError):
+            DeepSeekAttributeWriter._validate_extraction_shape(invalid)
+
+    def test_validate_extraction_shape_accepts_value_and_evidence_objects(self) -> None:
+        valid = {
+            "material": {"value": "stainless steel", "evidence": "Stainless Steel Band"},
+            "color": None,
+            "size": None,
+            "size_options": [],
+            "style": None,
+            "use_case": None,
+            "feature": {"value": "water resistant", "evidence": "Water Resistant"},
+            "other": None,
+        }
+        self.assertEqual(DeepSeekAttributeWriter._validate_extraction_shape(valid), valid)
+
+    def test_validate_extraction_shape_normalizes_missing_size_options(self) -> None:
+        claims = {
+            "material": None,
+            "color": None,
+            "size": None,
+            "size_options": None,
+            "style": None,
+            "use_case": None,
+            "feature": None,
+            "other": None,
+        }
+        normalized = DeepSeekAttributeWriter._validate_extraction_shape(claims)
+        self.assertEqual(normalized["size_options"], [])
 
 
 if __name__ == "__main__":

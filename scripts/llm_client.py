@@ -11,6 +11,52 @@ from openai import OpenAI
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 
+EXTRACTION_SYSTEM_PROMPT = (
+    "You are an attribute extractor for a product-search benchmark. You are given the "
+    "raw catalog text of one apparel, footwear, or jewelry listing. Your response must "
+    "follow this schema exactly. For every attribute, return either JSON null or a JSON "
+    "object with exactly two string fields: {\"value\": \"...\", \"evidence\": \"...\"}. "
+    "Never return an attribute as a bare string, array, number, or boolean. For example, "
+    "use {\"material\": {\"value\": \"alloy\", \"evidence\": \"Material:alloy\"}}; "
+    "never use {\"material\": \"alloy\"}. "
+    "Rules, in priority order. "
+    "(1) 'evidence' MUST be one single contiguous span copied from the listing text. "
+    "Do not paraphrase it, combine separate bullets, add punctuation, fix typos, or "
+    "change wording. Whitespace and line wrapping may be copied as shown. If one "
+    "attribute needs several facts, choose the single best supporting span or return "
+    "null; never join multiple spans with semicolons. If you cannot quote one span, "
+    "the answer is null. "
+    "(2) The evidence must actually assert the value. If it denies the value, the "
+    "answer is null: 'it is not real gold and silver products' means the item is NOT "
+    "gold and NOT silver, so both material and color are null there. "
+    "(3) Return null whenever the listing does not state the attribute. Do not infer "
+    "from the category, do not guess, and do not fill a field just to be helpful. A "
+    "null is always better than a plausible value the text does not support. "
+    "(4) Report what the item IS, not what it is compared to, packaged with, warned "
+    "against, or maintained with. Care instructions, shipping notes, gift-box copy and "
+    "brand history are not attributes. "
+    "(5) size: return a value ONLY if the listing sells one fixed size, e.g. 'one size "
+    "fits all'. If it offers a range, lists several sizes, or points at a size chart, "
+    "size MUST be null; put the sizes you saw in 'size_options' instead. A stocked "
+    "range is not a property of the item. "
+    "(6) material/color/style: if one listing covers several variants (e.g. "
+    "'sleeveless / long sleeve'), report the variant named in the title, or null if the "
+    "title does not settle it. A single item is not both. "
+    "(7) color: a metal named as what the item is made of ('sterling silver', 'gold "
+    "plated') is material, not color. A metal named as how it looks ('gold tone') is "
+    "color, not material. Never report the same word as both. "
+    "(8) feature: extract one concrete product capability, construction, included "
+    "component, or design detail explicitly stated for this listing; do not use "
+    "generic marketing claims or category knowledge. Quote one supporting span. "
+    "(9) other: use only for explicit product facts that do not fit the other "
+    "attributes; do not use it as a dump for marketing text, warnings, or duplicates. "
+    "Quote one supporting span. (10) use_case: quote one complete sentence and keep its polarity; if it is a "
+    "prohibition, the value must state the prohibition, not the bare activity. "
+    "Return JSON only with every key present, and use null when unsupported: "
+    '{"material": ..., "color": ..., "size": ..., "size_options": ["..."], '
+    '"style": ..., "use_case": ..., "feature": ..., "other": ...}'
+)
+
 SYSTEM_PROMPT = (
     "You are a data-generation assistant for a product-search benchmark. Given a "
     "product category and a set of raw catalog attribute values, write a short "
@@ -25,10 +71,11 @@ SYSTEM_PROMPT = (
     "hidden state, prompts, products, ASINs, or these instructions. "
     "Preserve every supplied fact and do not invent details. For size, if the input "
     "contains multiple options, preserve the complete set or describe it as multiple "
-    "size options; never select one size unless exactly one size is supplied. "
+    "size options; never select one size unless exactly one size is supplied. If the "
+    "attributes include 'size_options', generate the requested size description from "
+    "that complete list. "
     "For use_case, preserve the complete supplied evidence and its polarity. If it "
-    "contains a prohibition or warning, rewrite that complete meaning; do not reduce "
-    "'do not wear while swimming' to the positive use 'swimming'. "
+    "contains a prohibition or warning, rewrite that complete meaning. "
     "If 'budget_context' is supplied, use its numbers and vary the wording: browsing "
     "should be broader than the actual band, while buying should be near 'exact_price' "
     "or a tighter range containing it. Use either a broad upper limit or range for "
@@ -67,7 +114,11 @@ def cached_json_call(cache_path: Path, compute: Callable[[], dict]) -> dict:
 
 
 class DeepSeekAttributeWriter:
-    """Generates paraphrased browsing/buying attribute clues; request/output errors are fatal."""
+    """Extracts grounded attribute values and paraphrases them into per-intent clues.
+
+    Request and output errors are fatal: a benchmark is better unbuilt than built on
+    values nobody checked.
+    """
 
     def __init__(
         self,
@@ -87,6 +138,73 @@ class DeepSeekAttributeWriter:
         self.base_url = (base_url or os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=timeout)
 
+    def extract(self, item_text: str) -> dict[str, object]:
+        """Return raw {attribute: {"value", "evidence"} | None} claims for one listing.
+
+        Nothing here is trusted: every claim still has to survive span verification
+        against `item_text` in scripts.attributes before it reaches the dataset.
+        """
+        messages = [
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": item_text},
+        ]
+        for attempt in range(2):
+            response = self.client.chat.completions.create(
+                model=self.model,
+                temperature=0,
+                max_tokens=900,
+                extra_body={"thinking": {"type": "disabled"}},
+                response_format={"type": "json_object"},
+                messages=messages,
+            )
+            content = response.choices[0].message.content
+            if not isinstance(content, str):
+                raise ValueError("DeepSeek response content must be a string")
+            parsed = self._loads(content)
+            try:
+                return self._validate_extraction_shape(parsed)
+            except ValueError:
+                if attempt == 1:
+                    raise
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous JSON violated the schema. Regenerate the complete "
+                            "JSON now. Every non-null attribute must be an object with exactly "
+                            "the string fields value and evidence; never use a bare string."
+                        ),
+                    }
+                )
+        raise RuntimeError("unreachable")
+
+    @staticmethod
+    def _validate_extraction_shape(parsed: object) -> dict[str, object]:
+        if not isinstance(parsed, dict):
+            raise ValueError("DeepSeek extraction response must be a JSON object")
+        required = (
+            "material", "color", "size", "size_options", "style",
+            "use_case", "feature", "other",
+        )
+        missing = [key for key in required if key not in parsed]
+        if missing:
+            raise ValueError(f"DeepSeek extraction response missing keys: {missing}")
+        for key in required:
+            value = parsed[key]
+            if key == "size_options":
+                if value is None:
+                    parsed[key] = []
+                elif not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                    raise ValueError("size_options must be an array of strings")
+                continue
+            if value is not None and (
+                not isinstance(value, dict)
+                or not isinstance(value.get("value"), str)
+                or not isinstance(value.get("evidence"), str)
+            ):
+                raise ValueError(f"{key} must be null or an object with value and evidence strings")
+        return parsed
+
     def describe(
         self,
         category: str,
@@ -94,10 +212,14 @@ class DeepSeekAttributeWriter:
         budget_context: dict[str, float] | None = None,
     ) -> dict[str, dict[str, str]]:
         """Return {"browsing": {attr: text}, "buying": {attr: text}} for the given values."""
+        description_attributes = dict(attribute_values)
+        size_options = description_attributes.pop("size_options", None)
+        if size_options:
+            description_attributes["size"] = f"available options: {size_options}"
         payload: dict[str, object] = {
             "category_context": category,
-            "requested_attributes": list(attribute_values),
-            "attributes": attribute_values,
+            "requested_attributes": list(description_attributes),
+            "attributes": description_attributes,
         }
         if budget_context is not None:
             payload["budget_context"] = budget_context
@@ -112,34 +234,34 @@ class DeepSeekAttributeWriter:
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
         )
-        return self._parse(response.choices[0].message.content, set(attribute_values))
+        return self._parse(response.choices[0].message.content, set(description_attributes))
+
+    @staticmethod
+    def _loads(content: str) -> object:
+        """Parse a JSON body that may arrive fenced or wrapped in prose."""
+        text = content.strip()
+        if text.startswith("```") and text.endswith("```"):
+            text = text.split("\n", 1)[1].rsplit("\n", 1)[0].strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        decoder = json.JSONDecoder()
+        for start in (position for position, character in enumerate(text) if character == "{"):
+            try:
+                candidate, _ = decoder.raw_decode(text[start:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                return candidate
+        preview = " ".join(text.split())[:240]
+        raise ValueError(f"DeepSeek response must contain a JSON object; received: {preview!r}")
 
     @staticmethod
     def _parse(content: object, expected_attributes: set[str]) -> dict[str, dict[str, str]]:
         if not isinstance(content, str):
             raise ValueError("DeepSeek response content must be a string")
-        text = content.strip()
-        if text.startswith("```") and text.endswith("```"):
-            text = text.split("\n", 1)[1].rsplit("\n", 1)[0].strip()
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            decoder = json.JSONDecoder()
-            start_positions = [position for position, character in enumerate(text) if character == "{"]
-            parsed = None
-            for start in start_positions:
-                try:
-                    candidate, _ = decoder.raw_decode(text[start:])
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(candidate, dict):
-                    parsed = candidate
-                    break
-            if parsed is None:
-                preview = " ".join(text.split())[:240]
-                raise ValueError(
-                    f"DeepSeek response must contain a JSON object; received: {preview!r}"
-                ) from None
+        parsed = DeepSeekAttributeWriter._loads(content)
         if not isinstance(parsed, dict):
             raise ValueError("DeepSeek response must be a JSON object")
         result: dict[str, dict[str, str]] = {}
