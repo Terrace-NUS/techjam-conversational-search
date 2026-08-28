@@ -96,9 +96,43 @@ def behavior_for(scenario: str, card: dict, rng: random.Random) -> dict:
     return behavior
 
 
+def sample_intent(sample: dict) -> str:
+    intent = sample.get("intent")
+    if intent in {"buying", "browsing"}:
+        return intent
+    scenario = sample.get("scenario_type")
+    return "buying" if scenario == "buying" else "browsing"
+
+
+def sample_has_override(sample: dict) -> bool:
+    return bool(sample.get("override", sample.get("scenario_type") == "intent_override"))
+
+
+def normalize_public_samples(samples: list[dict]) -> list[dict]:
+    override_index = 0
+    normalized: list[dict] = []
+    for sample in samples:
+        scenario = sample.get("scenario_type")
+        if scenario == "intent_override":
+            intent = "buying" if override_index < 20 else "browsing"
+            override_index += 1
+            has_override = True
+        elif scenario == "buying":
+            intent = "buying"
+            has_override = False
+        else:
+            intent = "browsing"
+            has_override = False
+        normalized.append({**sample, "intent": intent, "override": has_override})
+    return normalized
+
+
 def load_jsonl(path: str | Path) -> list[dict]:
     with Path(path).open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+        samples = [json.loads(line) for line in handle if line.strip()]
+    if Path(path).name == "public_set.jsonl":
+        return normalize_public_samples(samples)
+    return samples
 
 
 def normalize_recommendations(payload: object, catalog_ids: set[str]) -> list[str]:
@@ -187,12 +221,12 @@ def classify_constraint(value: str) -> str:
 
 
 def initial_message(sample: dict, category: str, disclosed: set[str]) -> str:
-    scenario = sample["scenario_type"]
-    if scenario == "buying" and sample["intent_card"].get("hard_constraints"):
+    intent = sample_intent(sample)
+    if intent == "buying" and sample["intent_card"].get("hard_constraints"):
         constraint = str(sample["intent_card"]["hard_constraints"][0])
         disclosed.add(constraint)
         return f"I'm looking for {category}. A key requirement is: {constraint}."
-    if scenario == "intent_override":
+    if sample_has_override(sample):
         old_value = str(sample["behavior"]["override"]["old_value"])
         return f"I'm looking for {category}. {old_value}"
     return f"I'm looking for {category}, but I'm still exploring."
@@ -494,7 +528,8 @@ def materialize_hidden_fields(sample: dict, products: dict[str, dict]) -> tuple[
     card = intent_card(product)
     seed_source = f"{sample.get('sample_id', '')}\0{sample.get('scenario_type', '')}"
     rng = random.Random(seed_source)
-    behavior = behavior_for(str(sample["scenario_type"]), card, rng)
+    scenario = "intent_override" if sample_has_override(sample) else sample_intent(sample)
+    behavior = behavior_for(scenario, card, rng)
     return card, behavior
 
 
@@ -521,13 +556,13 @@ def _evaluate_sample(
     custom_item = (items or {}).get(target)
     custom_modification = (modifications or {}).get(target)
     custom_override = (
-        sample["scenario_type"] == "intent_override"
+        sample_has_override(sample)
         and custom_item is not None
         and custom_modification is not None
     )
     if custom_item is not None:
         try:
-            initial_intent = "buying" if sample["scenario_type"] == "buying" else "browsing"
+            initial_intent = sample_intent(sample)
             session = create_session(
                 str(sample["sample_id"]),
                 custom_item,
@@ -540,7 +575,7 @@ def _evaluate_sample(
     user_message = reply_model.initial_message(
         effective_sample, coarse_category(categories.get(target, [])), disclosed
     )
-    override_applied = sample["scenario_type"] != "intent_override"
+    override_applied = not sample_has_override(sample)
     prompt_tokens = 0
     completion_tokens = 0
     hit_turn: int | None = None
@@ -584,22 +619,12 @@ def _evaluate_sample(
             new_value = str(override.get("new_value", ""))
             if new_value:
                 disclosed.add(new_value)
-            if query_handler is not None:
-                query_handler.set_intent("buying")
             user_message = reply_model.override_message(override)
         elif query_handler is not None:
-            if sample["scenario_type"] == "boundary" and not boundary_used:
-                attribute = response.get("ask_attribute")
-                if isinstance(attribute, str) and attribute:
-                    user_message = f"I don't have a preference for {attribute}; please use your judgment."
-                    boundary_used = True
-                else:
-                    user_message = "Those options are not quite right yet. Ask me about one specific attribute."
-            else:
-                canonical_message = query_handler.answer(response.get("ask_attribute"), turn + 1)
-                user_message = reply_model.rewrite_query_answer(
-                    canonical_message or "I don't have an additional preference for that."
-                )
+            canonical_message = query_handler.answer(response.get("ask_attribute"), turn + 1)
+            user_message = reply_model.rewrite_query_answer(
+                canonical_message or "I don't have an additional preference for that."
+            )
         else:
             user_message, boundary_used = reply_model.customer_reply(
                 effective_sample, response.get("ask_attribute"), disclosed, boundary_used
@@ -607,7 +632,8 @@ def _evaluate_sample(
     return (
         {
             "sample_id": sample["sample_id"],
-            "scenario_type": sample["scenario_type"],
+            "scenario_type": sample_intent(sample),
+            "override": sample_has_override(sample),
             "hit": hit_turn is not None,
             "first_hit_turn": hit_turn,
             "best_rank": best_rank,
