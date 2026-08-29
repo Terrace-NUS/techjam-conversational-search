@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from openai import OpenAI
 from starter.agent import Agent, build_agent
 from scripts.intent_manager import IntentManager
+from scripts.query_attribute import extract_attribute
 from scripts.query_handler import QueryHandler
 from scripts.schema import Item, Modification
 from scripts.session import create_session
@@ -593,6 +594,21 @@ def materialize_hidden_fields(sample: dict, products: dict[str, dict]) -> tuple[
     return card, behavior
 
 
+def query_attribute_from_response(response: dict, query_handler: QueryHandler) -> str | None:
+    """Resolve the agent's natural-language question to this item's attribute.
+
+    ``ask_attribute`` remains a compatibility fallback for agents built against
+    the original structured-field contract.  A recognized attribute in
+    ``message`` always takes precedence.
+    """
+    available = query_handler.item.intent_descriptions.get(query_handler.intent, {})
+    attribute = extract_attribute(response.get("message"), available)
+    if attribute is not None:
+        return attribute
+    fallback = response.get("ask_attribute")
+    return fallback if isinstance(fallback, str) and fallback in available else None
+
+
 def _evaluate_sample(
     agent: Agent,
     sample: dict,
@@ -687,14 +703,15 @@ def _evaluate_sample(
                 query_handler.set_intent(intent_manager.intent)
         override = effective_sample.get("behavior", {}).get("override") or {}
         if not override_applied and custom_override:
+            asked_attribute = query_attribute_from_response(response, query_handler)
             if turn + 1 >= custom_modification.modify_turn:
-                canonical_message = query_handler.answer(response.get("ask_attribute"), turn + 1)
+                canonical_message = query_handler.answer(asked_attribute, turn + 1)
                 override_applied = True
                 user_message = reply_model.rewrite_query_answer(
                     canonical_message or "I have updated my preferences."
                 )
             else:
-                canonical_message = query_handler.answer(response.get("ask_attribute"), turn + 1)
+                canonical_message = query_handler.answer(asked_attribute, turn + 1)
                 user_message = reply_model.rewrite_query_answer(
                     canonical_message or "I don't have an additional preference for that."
                 )
@@ -705,7 +722,8 @@ def _evaluate_sample(
                 disclosed.add(new_value)
             user_message = reply_model.override_message(override)
         elif query_handler is not None:
-            canonical_message = query_handler.answer(response.get("ask_attribute"), turn + 1)
+            asked_attribute = query_attribute_from_response(response, query_handler)
+            canonical_message = query_handler.answer(asked_attribute, turn + 1)
             user_message = reply_model.rewrite_query_answer(
                 canonical_message or "I don't have an additional preference for that."
             )

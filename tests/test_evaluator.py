@@ -14,12 +14,15 @@ from evaluator.local_evaluator import (
     evaluate,
     metric_summary,
     normalize_recommendations,
+    query_attribute_from_response,
 )
 from scripts.structured_text import structured_product_text
 from starter.agent import Agent, build_agent
 from starter.baseline import BaselineAgent
 from starter.v1 import V1Agent
 from scripts.schema import Item
+from scripts.query_handler import QueryHandler
+from scripts import query_attribute as query_attribute_module
 
 
 class EchoTargetAgent:
@@ -81,7 +84,59 @@ class FixedRewardCalculator:
         return self.subscore
 
 
+class FakeAttributeExtractor:
+    """Stand-in for DeepSeekAttributeExtractor; maps exact query text to an attribute."""
+
+    def __init__(self, mapping: dict[str, str | None]) -> None:
+        self.mapping = mapping
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def extract(self, query: str, candidates: tuple[str, ...]) -> str | None:
+        self.calls.append((query, candidates))
+        return self.mapping.get(query)
+
+
 class EvaluatorTest(unittest.TestCase):
+    def test_natural_language_query_selects_matching_item_attribute(self) -> None:
+        item = Item(
+            "A",
+            {},
+            {
+                "browsing": {
+                    "material": "material clue",
+                    "color": "color clue",
+                    "size": "size clue",
+                    "style": "style clue",
+                },
+                "buying": {
+                    "material": "buying material clue",
+                    "color": "buying color clue",
+                    "size": "buying size clue",
+                    "style": "buying style clue",
+                },
+            },
+        )
+        handler = QueryHandler("natural-query", item)
+        query_attribute_module.set_default_extractor(
+            FakeAttributeExtractor({"Could you tell me what fabric you prefer?": "material"})
+        )
+        self.addCleanup(query_attribute_module.set_default_extractor, None)
+        response = {"message": "Could you tell me what fabric you prefer?", "ask_attribute": "color"}
+        self.assertEqual(query_attribute_from_response(response, handler), "material")
+        self.assertEqual(handler.answer(query_attribute_from_response(response, handler)), "material clue")
+
+    def test_structured_attribute_remains_a_fallback_when_message_has_no_attribute(self) -> None:
+        item = Item(
+            "A", {}, {intent: {attribute: attribute for attribute in ("material", "color", "size", "style")} for intent in ("browsing", "buying")}
+        )
+        handler = QueryHandler("fallback-query", item)
+        query_attribute_module.set_default_extractor(FakeAttributeExtractor({}))
+        self.addCleanup(query_attribute_module.set_default_extractor, None)
+        self.assertEqual(
+            query_attribute_from_response({"message": "Thanks.", "ask_attribute": "style"}, handler),
+            "style",
+        )
+
     def test_searchable_text_prioritizes_structured_fields_and_filters_noise(self) -> None:
         text = structured_product_text({
             "title": "Premium Cotton Shirt",
