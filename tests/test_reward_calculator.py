@@ -66,9 +66,21 @@ class RewardCalculatorTest(unittest.TestCase):
             "C": [1.0, 0.0],
             "D": [0.6, 0.8],
         })
-        calculator = RewardCalculator(client, text_fn=lambda product: product["title"], baseline_sample_size=2, margin_scale=1.0)
-        # The result is the positive margin rather than the raw high cosine.
-        self.assertAlmostEqual(calculator.score_turn(["B"], "A", products), 0.1, places=6)
+        with tempfile.TemporaryDirectory() as directory:
+            calculator = RewardCalculator(client, text_fn=lambda product: product["title"], baseline_sample_size=2, margin_scale=1.0, baseline_cache_path=Path(directory) / "baselines.json")
+            # The result is the positive margin rather than the raw high cosine.
+            self.assertAlmostEqual(calculator.score_turn(["B"], "A", products), 0.1, places=6)
+
+    def test_baseline_persists_between_calculators(self) -> None:
+        products = {asin: {"title": asin} for asin in ("A", "B", "C", "D")}
+        vectors = {"A": [1.0, 0.0], "B": [0.9, (1.0 - 0.9 ** 2) ** 0.5], "C": [1.0, 0.0], "D": [0.6, 0.8]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "baselines.json"
+            first_client = FakeEmbeddingClient(vectors)
+            RewardCalculator(first_client, lambda p: p["title"], baseline_sample_size=2, margin_scale=1.0, baseline_cache_path=path).score_turn(["B"], "A", products)
+            second_client = FakeEmbeddingClient(vectors)
+            RewardCalculator(second_client, lambda p: p["title"], baseline_sample_size=2, margin_scale=1.0, baseline_cache_path=path).score_turn(["B"], "A", products)
+            self.assertEqual(second_client.calls, ["A", "B"])
 
 
 class GeminiEmbeddingClientTest(unittest.TestCase):

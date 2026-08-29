@@ -9,6 +9,7 @@ import statistics
 import ssl
 import urllib.error
 import urllib.request
+import threading
 from pathlib import Path
 from typing import Callable
 
@@ -132,6 +133,43 @@ class GeminiEmbeddingClient:
         return values
 
 
+class SiliconFlowEmbeddingClient(GeminiEmbeddingClient):
+    """SiliconFlow embeddings through its OpenAI-compatible API."""
+
+    DEFAULT_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+    DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        cache_dir: str | Path = "data/cache/embeddings",
+        timeout: float = 30.0,
+    ) -> None:
+        _load_dotenv()
+        self.api_key = api_key or os.environ.get("SILICONFLOW_API_KEY", "").strip()
+        if not self.api_key:
+            raise RuntimeError(
+                "SILICONFLOW_API_KEY is required for SiliconFlow embedding scoring; "
+                "set it in the environment or a .env file."
+            )
+        self.model = model or os.environ.get("SILICONFLOW_EMBEDDING_MODEL", self.DEFAULT_MODEL)
+        self.base_url = (base_url or os.environ.get("SILICONFLOW_BASE_URL", self.DEFAULT_BASE_URL)).rstrip("/")
+        self.cache_dir = Path(cache_dir)
+        self.timeout = timeout
+        from openai import OpenAI
+
+        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=timeout)
+
+    def _request(self, text: str) -> list[float]:
+        response = self.client.embeddings.create(model=self.model, input=text[: self.MAX_INPUT_CHARS])
+        values = response.data[0].embedding if response.data else None
+        if not isinstance(values, list) or not values:
+            raise ValueError("SiliconFlow embeddings response missing data")
+        return values
+
+
 class RewardCalculator:
     """Per-turn subscore: rank-1 recommendation relevance to the session's ground truth."""
 
@@ -141,12 +179,16 @@ class RewardCalculator:
         text_fn: Callable[[dict], str],
         baseline_sample_size: int = 32,
         margin_scale: float = 10.0,
+        baseline_cache_path: str | Path = "data/cache/baselines.json",
     ) -> None:
         self.embedding_client = embedding_client
         self.text_fn = text_fn
         self.baseline_sample_size = max(0, baseline_sample_size)
         self.margin_scale = max(0.0, margin_scale)
+        self.baseline_cache_path = Path(baseline_cache_path)
         self._baseline_cache: dict[str, float] = {}
+        self._baseline_lock = threading.Lock()
+        self._baseline_metadata: dict[str, object] | None = None
 
     def score_turn(self, ranked: list[str], target_asin: str, products: dict[str, dict]) -> float:
         """Return a subscore in [0, 1] for the current turn's ranked recommendations.
@@ -185,20 +227,52 @@ class RewardCalculator:
         cached = self._baseline_cache.get(target_asin)
         if cached is not None:
             return cached
+        # Keep the rank-1 item out of the negative reference set so it cannot
+        # inflate its own baseline.
         candidates = [asin for asin in products if asin not in {target_asin, rank1_asin}]
         if not candidates or self.baseline_sample_size <= 0:
             return None
-        rng = random.Random(target_asin)
-        sample = rng.sample(candidates, min(self.baseline_sample_size, len(candidates)))
-        similarities = []
-        for asin in sample:
-            product = products.get(asin)
-            if product is None:
-                continue
-            vector = self.embedding_client.embed(asin, self.text_fn(product))
-            similarities.append(cosine_similarity(vector, target_vector))
-        if not similarities:
-            return None
-        baseline = statistics.median(similarities)
-        self._baseline_cache[target_asin] = baseline
-        return baseline
+        with self._baseline_lock:
+            cached = self._baseline_cache.get(target_asin)
+            if cached is not None:
+                return cached
+            self._load_baselines(products)
+            cached = self._baseline_cache.get(target_asin)
+            if cached is not None:
+                return cached
+            rng = random.Random(target_asin)
+            sample = rng.sample(candidates, min(self.baseline_sample_size, len(candidates)))
+            similarities = []
+            for asin in sample:
+                product = products.get(asin)
+                if product is not None:
+                    vector = self.embedding_client.embed(asin, self.text_fn(product))
+                    similarities.append(max(0.0, cosine_similarity(vector, target_vector)))
+            if not similarities:
+                return None
+            baseline = statistics.median(similarities)
+            self._baseline_cache[target_asin] = baseline
+            self._save_baselines(products)
+            return baseline
+
+    def _load_baselines(self, products: dict[str, dict]) -> None:
+        if self._baseline_metadata is not None:
+            return
+        fingerprint = hashlib.sha256("\0".join(sorted(products)).encode()).hexdigest()
+        metadata = {"model": getattr(self.embedding_client, "model", None), "sample_size": self.baseline_sample_size, "catalog": fingerprint}
+        self._baseline_metadata = metadata
+        if not self.baseline_cache_path.is_file():
+            return
+        try:
+            payload = json.loads(self.baseline_cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if payload.get("metadata") == metadata and isinstance(payload.get("baselines"), dict):
+            self._baseline_cache.update({str(k): float(v) for k, v in payload["baselines"].items()})
+
+    def _save_baselines(self, products: dict[str, dict]) -> None:
+        self.baseline_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"metadata": self._baseline_metadata, "baselines": self._baseline_cache}
+        temporary_path = self.baseline_cache_path.with_suffix(".tmp")
+        temporary_path.write_text(json.dumps(payload), encoding="utf-8")
+        temporary_path.replace(self.baseline_cache_path)

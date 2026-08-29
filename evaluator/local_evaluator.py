@@ -843,16 +843,31 @@ def main() -> None:
         default=DEFAULT_INTENT_THRESHOLD,
         help="Subscore threshold for the Intent Manager's browsing->buying escalation.",
     )
+    parser.add_argument(
+        "--embedding-provider",
+        choices=("gemini", "siliconflow"),
+        default=os.environ.get("EMBEDDING_PROVIDER", "gemini"),
+        help="Embedding API provider (defaults to EMBEDDING_PROVIDER or gemini).",
+    )
     args = parser.parse_args()
     samples = load_jsonl(args.dataset)
     catalog_ids, categories, products = catalog_index(args.catalog)
     items, modifications = custom_data_index(args.items, args.modifications)
     # Reward scoring runs unconditionally; a missing GEMINI_API_KEY fails fast here
     # with a clear error instead of silently skipping intent escalation.
-    from scripts.reward_calculator import GeminiEmbeddingClient, RewardCalculator
+    from scripts.reward_calculator import (
+        GeminiEmbeddingClient,
+        RewardCalculator,
+        SiliconFlowEmbeddingClient,
+    )
     from scripts.structured_text import structured_product_text
 
-    reward_calculator = RewardCalculator(GeminiEmbeddingClient(), text_fn=structured_product_text)
+    embedding_client = (
+        SiliconFlowEmbeddingClient()
+        if args.embedding_provider == "siliconflow"
+        else GeminiEmbeddingClient()
+    )
+    reward_calculator = RewardCalculator(embedding_client, text_fn=structured_product_text)
     result = evaluate(
         build_agent(args.agent, args.catalog),
         samples,
