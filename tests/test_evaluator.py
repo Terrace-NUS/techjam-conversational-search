@@ -15,6 +15,7 @@ from evaluator.local_evaluator import (
     metric_summary,
     normalize_recommendations,
 )
+from scripts.structured_text import structured_product_text
 from starter.agent import Agent, build_agent
 from starter.baseline import BaselineAgent
 from starter.v1 import V1Agent
@@ -81,6 +82,39 @@ class FixedRewardCalculator:
 
 
 class EvaluatorTest(unittest.TestCase):
+    def test_searchable_text_prioritizes_structured_fields_and_filters_noise(self) -> None:
+        text = structured_product_text({
+            "title": "Premium Cotton Shirt",
+            "store": "Acme",
+            "categories": ["Clothing", "Shirts", "Shirts"],
+            "features": ["100% Cotton", "Machine Wash", "100% Cotton"],
+            "details": {
+                "Material": "Cotton",
+                "Color": "Blue",
+                "Item model number": "XYZ-1",
+            },
+            "description": ["Best Seller! " + ("Long marketing copy. " * 100)],
+            "price": 24.5,
+        })
+        self.assertIn("TITLE: premium cotton shirt", text)
+        self.assertIn("BRAND: acme", text)
+        self.assertIn("CATEGORY: clothing | shirts", text)
+        self.assertIn("ATTRIBUTES: material: cotton | color: blue", text)
+        self.assertIn("PRICE: 24.5", text)
+        self.assertNotIn("item model number", text)
+        self.assertNotIn("best seller", text)
+        self.assertLessEqual(len(text.split("DESCRIPTION: ", 1)[1]), 500)
+
+    def test_searchable_text_omits_empty_and_duplicate_values(self) -> None:
+        text = structured_product_text({
+            "title": "  Shirt  ",
+            "categories": ["Shirts", "shirts", ""],
+            "features": [],
+            "details": {},
+            "description": [],
+        })
+        self.assertEqual(text, "TITLE: shirt\nCATEGORY: shirts")
+
     def test_agent_factory_uses_abc_implementations(self) -> None:
         self.assertTrue(issubclass(BaselineAgent, Agent))
         self.assertTrue(issubclass(V1Agent, Agent))

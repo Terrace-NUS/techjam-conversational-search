@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -57,6 +58,18 @@ class RewardCalculatorTest(unittest.TestCase):
         self.assertEqual(calculator.score_turn(["B"], "A", self.products), 0.0)
         self.assertEqual(sorted(client.calls), ["A", "B"])
 
+    def test_miss_scores_relative_to_catalog_baseline(self) -> None:
+        products = {asin: {"title": asin} for asin in ("A", "B", "C", "D")}
+        client = FakeEmbeddingClient({
+            "A": [1.0, 0.0],
+            "B": [0.9, (1.0 - 0.9 ** 2) ** 0.5],
+            "C": [1.0, 0.0],
+            "D": [0.6, 0.8],
+        })
+        calculator = RewardCalculator(client, text_fn=lambda product: product["title"], baseline_sample_size=2, margin_scale=1.0)
+        # The result is the positive margin rather than the raw high cosine.
+        self.assertAlmostEqual(calculator.score_turn(["B"], "A", products), 0.1, places=6)
+
 
 class GeminiEmbeddingClientTest(unittest.TestCase):
     def test_missing_api_key_raises(self) -> None:
@@ -77,7 +90,11 @@ class GeminiEmbeddingClientTest(unittest.TestCase):
             request.assert_called_once()
             self.assertEqual(
                 json.loads((cache_dir / "A.json").read_text(encoding="utf-8")),
-                {"values": [0.1, 0.2]},
+                {
+                    "model": client.model,
+                    "text_hash": hashlib.sha256("target product".encode("utf-8")).hexdigest(),
+                    "values": [0.1, 0.2],
+                },
             )
 
 

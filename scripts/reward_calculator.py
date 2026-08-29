@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
+import random
+import statistics
 import ssl
 import urllib.error
 import urllib.request
@@ -85,13 +88,23 @@ class GeminiEmbeddingClient:
         self.timeout = timeout
 
     def embed(self, asin: str, text: str) -> list[float]:
-        """Return the embedding for `text`, keyed and cached by `asin`."""
+        """Return the embedding for `text`, invalidating stale ASIN caches."""
         cache_path = self.cache_dir / f"{asin}.json"
+        text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         if cache_path.is_file():
-            return json.loads(cache_path.read_text(encoding="utf-8"))["values"]
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (
+                cached.get("model") == self.model
+                and cached.get("text_hash") == text_hash
+                and isinstance(cached.get("values"), list)
+            ):
+                return cached["values"]
         values = self._request(text)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps({"values": values}), encoding="utf-8")
+        cache_path.write_text(
+            json.dumps({"model": self.model, "text_hash": text_hash, "values": values}),
+            encoding="utf-8",
+        )
         return values
 
     def _request(self, text: str) -> list[float]:
@@ -122,9 +135,18 @@ class GeminiEmbeddingClient:
 class RewardCalculator:
     """Per-turn subscore: rank-1 recommendation relevance to the session's ground truth."""
 
-    def __init__(self, embedding_client: GeminiEmbeddingClient, text_fn: Callable[[dict], str]) -> None:
+    def __init__(
+        self,
+        embedding_client: GeminiEmbeddingClient,
+        text_fn: Callable[[dict], str],
+        baseline_sample_size: int = 32,
+        margin_scale: float = 10.0,
+    ) -> None:
         self.embedding_client = embedding_client
         self.text_fn = text_fn
+        self.baseline_sample_size = max(0, baseline_sample_size)
+        self.margin_scale = max(0.0, margin_scale)
+        self._baseline_cache: dict[str, float] = {}
 
     def score_turn(self, ranked: list[str], target_asin: str, products: dict[str, dict]) -> float:
         """Return a subscore in [0, 1] for the current turn's ranked recommendations.
@@ -143,6 +165,40 @@ class RewardCalculator:
         target_product = products.get(target_asin)
         if rank1_product is None or target_product is None:
             return 0.0
-        rank1_vector = self.embedding_client.embed(rank1_asin, self.text_fn(rank1_product))
         target_vector = self.embedding_client.embed(target_asin, self.text_fn(target_product))
-        return max(0.0, cosine_similarity(rank1_vector, target_vector))
+        rank1_vector = self.embedding_client.embed(rank1_asin, self.text_fn(rank1_product))
+        raw_similarity = max(0.0, cosine_similarity(rank1_vector, target_vector))
+        baseline = self._target_baseline(target_asin, rank1_asin, target_vector, products)
+        if baseline is None:
+            return raw_similarity
+        margin = max(0.0, raw_similarity - baseline)
+        return min(1.0, margin * self.margin_scale)
+
+    def _target_baseline(
+        self,
+        target_asin: str,
+        rank1_asin: str,
+        target_vector: list[float],
+        products: dict[str, dict],
+    ) -> float | None:
+        """Return a deterministic in-memory median similarity baseline for target."""
+        cached = self._baseline_cache.get(target_asin)
+        if cached is not None:
+            return cached
+        candidates = [asin for asin in products if asin not in {target_asin, rank1_asin}]
+        if not candidates or self.baseline_sample_size <= 0:
+            return None
+        rng = random.Random(target_asin)
+        sample = rng.sample(candidates, min(self.baseline_sample_size, len(candidates)))
+        similarities = []
+        for asin in sample:
+            product = products.get(asin)
+            if product is None:
+                continue
+            vector = self.embedding_client.embed(asin, self.text_fn(product))
+            similarities.append(cosine_similarity(vector, target_vector))
+        if not similarities:
+            return None
+        baseline = statistics.median(similarities)
+        self._baseline_cache[target_asin] = baseline
+        return baseline

@@ -52,6 +52,44 @@ def searchable_text(product: dict) -> str:
     return " ".join(parts).strip()
 
 
+def _normalized_text(value: object, limit: int) -> str:
+    values = _flatten_values(value)
+    if not values:
+        return ""
+    text = re.sub(r"\s+", " ", " ".join(values)).strip(" -;,.").strip()
+    lowered = text.casefold()
+    for phrase in MARKETING_PHRASES:
+        lowered = lowered.replace(phrase, " ")
+    text = re.sub(r"\s+", " ", lowered).strip(" -;,.")
+    return text[:limit].rstrip()
+
+
+def _unique_texts(value: object, limit: int) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in _flatten_values(value):
+        text = _normalized_text(item, limit)
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            result.append(text)
+    return result
+
+
+def _relevant_details(value: object) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    result: list[str] = []
+    for key, item in value.items():
+        key_text = _normalized_text(key, 80)
+        if not key_text or not any(token in key_text.casefold() for token in DETAIL_KEYWORDS):
+            continue
+        item_text = _normalized_text(item, ATTRIBUTE_MAX_CHARS)
+        if item_text:
+            result.append(f"{key_text}: {item_text}")
+    return _unique_texts(result, ATTRIBUTE_MAX_CHARS)
+
+
 def _flatten_values(value: object) -> list[str]:
     if isinstance(value, dict):
         return [f"{key}: {item}" for key, item in value.items() if item not in (None, "", [])]
@@ -812,8 +850,9 @@ def main() -> None:
     # Reward scoring runs unconditionally; a missing GEMINI_API_KEY fails fast here
     # with a clear error instead of silently skipping intent escalation.
     from scripts.reward_calculator import GeminiEmbeddingClient, RewardCalculator
+    from scripts.structured_text import structured_product_text
 
-    reward_calculator = RewardCalculator(GeminiEmbeddingClient(), text_fn=searchable_text)
+    reward_calculator = RewardCalculator(GeminiEmbeddingClient(), text_fn=structured_product_text)
     result = evaluate(
         build_agent(args.agent, args.catalog),
         samples,
