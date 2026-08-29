@@ -13,16 +13,22 @@ import threading
 import uuid
 from collections import defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from openai import OpenAI
 from starter.agent import Agent, build_agent
+from scripts.intent_manager import IntentManager
 from scripts.query_handler import QueryHandler
 from scripts.schema import Item, Modification
 from scripts.session import create_session
 
+if TYPE_CHECKING:
+    from scripts.reward_calculator import RewardCalculator
+
 
 MAX_TURNS = 10
 TOP_K = 10
+DEFAULT_INTENT_THRESHOLD = 0.5
 ALLOWED_ATTRIBUTES = {
     "category", "material", "color", "size", "style", "brand",
     "budget", "feature", "use_case", "other",
@@ -559,8 +565,11 @@ def _evaluate_sample(
     agent_lock: threading.Lock,
     items: dict[str, Item] | None = None,
     modifications: dict[str, Modification] | None = None,
+    reward_calculator: "RewardCalculator | None" = None,
+    intent_threshold: float = DEFAULT_INTENT_THRESHOLD,
 ) -> tuple[dict, int, int]:
     session_id = f"public_{uuid.uuid4().hex}"
+    intent_manager = IntentManager(sample_intent(sample), threshold=intent_threshold)
     with agent_lock:
         agent.reset(session_id, sample["user_profile"])
     target = str(sample["ground_truth"]["parent_asin"])
@@ -634,6 +643,10 @@ def _evaluate_sample(
             break
         if turn == MAX_TURNS:
             break
+        if reward_calculator is not None:
+            subscore = reward_calculator.score_turn(ranked, target, products)
+            if intent_manager.update(subscore) and query_handler is not None:
+                query_handler.set_intent(intent_manager.intent)
         override = effective_sample.get("behavior", {}).get("override") or {}
         if not override_applied and custom_override:
             if turn + 1 >= custom_modification.modify_turn:
@@ -671,6 +684,7 @@ def _evaluate_sample(
             "first_hit_turn": hit_turn,
             "best_rank": best_rank,
             "reciprocal_rank": 0.0 if best_rank is None else 1.0 / best_rank,
+            "final_intent": intent_manager.intent,
         },
         prompt_tokens,
         completion_tokens,
@@ -689,6 +703,8 @@ def evaluate(
     max_workers: int = 1,
     items: dict[str, Item] | None = None,
     modifications: dict[str, Modification] | None = None,
+    reward_calculator: "RewardCalculator | None" = None,
+    intent_threshold: float = DEFAULT_INTENT_THRESHOLD,
 ) -> dict:
     reply_model = reply_model or TemplateReplyModel()
     if max_workers < 1:
@@ -708,6 +724,8 @@ def evaluate(
         agent_lock,
         items,
         modifications,
+        reward_calculator,
+        intent_threshold,
     )
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -781,10 +799,21 @@ def main() -> None:
         default=None,
         help="Customer wording model; defaults to TECHJAM_REPLY_MODEL or template.",
     )
+    parser.add_argument(
+        "--intent-threshold",
+        type=float,
+        default=DEFAULT_INTENT_THRESHOLD,
+        help="Subscore threshold for the Intent Manager's browsing->buying escalation.",
+    )
     args = parser.parse_args()
     samples = load_jsonl(args.dataset)
     catalog_ids, categories, products = catalog_index(args.catalog)
     items, modifications = custom_data_index(args.items, args.modifications)
+    # Reward scoring runs unconditionally; a missing GEMINI_API_KEY fails fast here
+    # with a clear error instead of silently skipping intent escalation.
+    from scripts.reward_calculator import GeminiEmbeddingClient, RewardCalculator
+
+    reward_calculator = RewardCalculator(GeminiEmbeddingClient(), text_fn=searchable_text)
     result = evaluate(
         build_agent(args.agent, args.catalog),
         samples,
@@ -797,6 +826,8 @@ def main() -> None:
         max_workers=args.workers,
         items=items,
         modifications=modifications,
+        reward_calculator=reward_calculator,
+        intent_threshold=args.intent_threshold,
     )
     Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: value for key, value in result.items() if key != "sessions"}, indent=2))

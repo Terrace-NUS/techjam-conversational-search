@@ -18,6 +18,7 @@ from evaluator.local_evaluator import (
 from starter.agent import Agent, build_agent
 from starter.baseline import BaselineAgent
 from starter.v1 import V1Agent
+from scripts.schema import Item
 
 
 class EchoTargetAgent:
@@ -46,6 +47,37 @@ class ModificationAgent:
             "ask_attribute": "style",
             "recommendations": recommendations,
         }
+
+
+class IntentEscalationAgent:
+    """Miss once, then hit; captures the query-handler reply between turns."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def reset(self, session_id: str, user_profile: dict) -> None:
+        pass
+
+    def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
+        self.messages.append(user_message)
+        asin = "B" if turn == 1 else "A"
+        return {
+            "message": "ok",
+            "ask_attribute": "style",
+            "recommendations": [{"parent_asin": asin}],
+        }
+
+
+class FixedRewardCalculator:
+    """Offline reward double: forces escalation without Gemini/network access."""
+
+    def __init__(self, subscore: float) -> None:
+        self.subscore = subscore
+        self.calls: list[tuple[list[str], str]] = []
+
+    def score_turn(self, ranked: list[str], target_asin: str, products: dict[str, dict]) -> float:
+        self.calls.append((ranked, target_asin))
+        return self.subscore
 
 
 class EvaluatorTest(unittest.TestCase):
@@ -170,6 +202,54 @@ class EvaluatorTest(unittest.TestCase):
             }]
             result = evaluate(EchoTargetAgent(), samples, catalog_ids, categories, products)
             self.assertEqual(result["hit_rate_at_10"], 1.0)
+
+    def test_subscore_escalates_custom_session_and_query_handler_uses_buying_intent(self) -> None:
+        products = {
+            "A": {"parent_asin": "A", "title": "target shirt"},
+            "B": {"parent_asin": "B", "title": "other shirt"},
+        }
+        items = {
+            "A": Item(
+                item_id="A",
+                features=products["A"],
+                intent_descriptions={
+                    "browsing": {
+                        "style": "browsing style",
+                        "material": "browsing material",
+                        "color": "browsing color",
+                        "size": "browsing size",
+                    },
+                    "buying": {
+                        "style": "buying style",
+                        "material": "buying material",
+                        "color": "buying color",
+                        "size": "buying size",
+                    },
+                },
+            )
+        }
+        agent = IntentEscalationAgent()
+        reward_calculator = FixedRewardCalculator(0.8)
+        result = evaluate(
+            agent,
+            [{
+                "sample_id": "intent_escalation_1",
+                "scenario_type": "browsing",
+                "user_profile": {},
+                "ground_truth": {"parent_asin": "A"},
+            }],
+            {"A", "B"},
+            {"A": ["Clothing", "Shirts"]},
+            products,
+            items=items,
+            reward_calculator=reward_calculator,
+            intent_threshold=0.5,
+        )
+
+        self.assertEqual(reward_calculator.calls, [(["B"], "A")])
+        self.assertEqual(result["sessions"][0]["final_intent"], "buying")
+        self.assertIn("buying style", agent.messages)
+        self.assertEqual(result["sessions"][0]["first_hit_turn"], 2)
 
     def test_custom_override_uses_fake_then_correction_at_modify_turn(self) -> None:
         catalog_ids = {"A"}
