@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+
 from evaluator.reply_model import ReplyModel
 from scripts.schema import Item, Modification
 from scripts.session import create_session
@@ -45,20 +47,6 @@ class V2Simulator(Simulator):
             )
         return modification
 
-    @staticmethod
-    def _intent_card(item: Item, intent: str, fallback_category: str) -> dict:
-        descriptions = item.intent_descriptions.get(intent, {})
-        constraints = [
-            str(value)
-            for attribute, value in descriptions.items()
-            if attribute != "category" and value not in (None, "")
-        ]
-        return {
-            "target_category": str(descriptions.get("category") or fallback_category),
-            "hard_constraints": constraints[:2],
-            "soft_preferences": constraints[2:4] or constraints[:1],
-        }
-
     def __init__(
         self,
         sample: dict,
@@ -75,19 +63,27 @@ class V2Simulator(Simulator):
         if self.override and self.modification is None:
             raise ValueError(f"v2 override sample {sample['sample_id']!r} has no modification")
         fallback_category = coarse_category(categories.get(self.target, []))
-        self.intent_card = self._intent_card(item, self.intent, fallback_category)
-        self.category = str(self.intent_card.get("target_category") or fallback_category)
+        self.descriptions = item.intent_descriptions.get(self.intent, {})
+        self.category = str(self.descriptions.get("category") or fallback_category)
+        constraints = [
+            str(value)
+            for attribute, value in self.descriptions.items()
+            if attribute != "category" and value not in (None, "")
+        ]
+        rng = random.Random(
+            f"{sample['sample_id']}:{item.item_id}:{self.intent}:initial_constraint"
+        )
+        self.initial_constraint = rng.choice(constraints) if constraints else None
         self.query_handler = create_session(
             str(sample["sample_id"]), item, self.modification, initial_intent=self.intent
         ).query_handler
         self.override_applied = not self.override
 
     def initial_message(self) -> str:
-        if self.override:
-            canonical = f"I'm looking for {self.category}, but I'm still exploring."
-        elif self.intent == "buying" and self.intent_card.get("hard_constraints"):
-            constraint = str(self.intent_card["hard_constraints"][0])
-            canonical = f"I'm looking for {self.category}. A key requirement is: {constraint}."
+        if self.intent == "buying" and self.initial_constraint:
+            canonical = (
+                f"I'm looking for {self.category}. "
+            )
         else:
             canonical = f"I'm looking for {self.category}, but I'm still exploring."
         return self.reply_model.rewrite_initial_message(canonical)

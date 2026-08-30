@@ -245,6 +245,52 @@ class EvaluatorTest(unittest.TestCase):
         self.assertEqual(result["hit_rate_at_10"], 1.0)
         self.assertEqual(result["override_metrics"]["sample_count"], 0)
 
+    def test_v2_initial_message_reads_current_intent_descriptions_directly(self) -> None:
+        product = {"parent_asin": "A"}
+        sample = {
+            "version": "v2",
+            "sample_id": "buy_1",
+            "intent": "buying",
+            "override": False,
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+            "item_id": "A",
+            "features": product,
+            "intent_descriptions": {
+                "browsing": {
+                    "style": "relaxed",
+                    "material": "natural fabric",
+                    "size": "several sizes",
+                    "category": "shirts",
+                },
+                "buying": {
+                    "style": "classic",
+                    "material": "cotton",
+                    "size": "medium",
+                    "category": "fitted shirts",
+                },
+            },
+            "fake_attributes": {},
+            "correction_messages": {},
+            "modify_turn": None,
+        }
+        simulator = V2Simulator(
+            sample,
+            {"A": ["Clothing", "Shirts"]},
+            {"A": product},
+            TemplateReplyModel(),
+            "session",
+        )
+        self.assertFalse(hasattr(simulator, "intent_card"))
+        self.assertIn(
+            simulator.initial_message(),
+            {
+                "I'm looking for fitted shirts. A key requirement is: classic.",
+                "I'm looking for fitted shirts. A key requirement is: cotton.",
+                "I'm looking for fitted shirts. A key requirement is: medium.",
+            },
+        )
+
     def test_mixed_dataset_switches_logic_per_record(self) -> None:
         product = {"parent_asin": "A"}
         legacy = {
