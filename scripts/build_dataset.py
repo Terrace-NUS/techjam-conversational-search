@@ -6,14 +6,69 @@ import json
 import logging
 from pathlib import Path
 
-from evaluator.local_evaluator import load_jsonl
-
 from .attributes import llm_extract_attributes
 from .intent_description import build_item
 from .llm_client import DeepSeekAttributeWriter
 from .modification import build_modification
+from .schema import Item, Modification
 
 logger = logging.getLogger(__name__)
+DATASET_NAME = "public_set_v2.jsonl"
+
+
+def _load_jsonl(path: Path) -> list[dict]:
+    with path.open(encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def _label_v2_samples(samples: list[dict]) -> list[tuple[dict, str, bool]]:
+    """Resolve legacy scenarios once so v2 records carry explicit intent state."""
+    override_index = 0
+    labeled: list[tuple[dict, str, bool]] = []
+    for sample in samples:
+        scenario = sample.get("scenario_type")
+        if scenario == "intent_override":
+            intent = "buying" if override_index < 20 else "browsing"
+            override_index += 1
+            override = True
+        elif scenario == "buying":
+            intent, override = "buying", False
+        else:
+            intent, override = "browsing", False
+        labeled.append((sample, intent, override))
+    return labeled
+
+
+def _v2_row(
+    sample: dict,
+    intent: str,
+    override: bool,
+    item: Item,
+    modification: Modification | None,
+) -> dict:
+    legacy_free_sample = {
+        key: value
+        for key, value in sample.items()
+        if key not in {"version", "scenario_type", "intent", "override"}
+    }
+    item_fields = dataclasses.asdict(item)
+    if modification is None:
+        modification_fields = {
+            "fake_attributes": {},
+            "correction_messages": {},
+            "modify_turn": None,
+        }
+    else:
+        modification_fields = dataclasses.asdict(modification)
+        modification_fields.pop("item_id")
+    return {
+        "version": "v2",
+        **legacy_free_sample,
+        "intent": intent,
+        "override": override,
+        **item_fields,
+        **modification_fields,
+    }
 
 
 def _load_catalog_products(catalog_path: Path, target_ids: set[str]) -> dict[str, dict]:
@@ -31,53 +86,6 @@ def _load_catalog_products(catalog_path: Path, target_ids: set[str]) -> dict[str
     return products
 
 
-def _load_ids(path: Path) -> set[str]:
-    if not path.is_file():
-        return set()
-    ids: set[str] = set()
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
-                ids.add(str(json.loads(line)["item_id"]))
-    return ids
-
-
-def backfill_modifications(out_dir: Path) -> None:
-    """Generate modifications for items already in items.jsonl that don't have one yet."""
-    items_path = out_dir / "items.jsonl"
-    modifications_path = out_dir / "modifications.jsonl"
-    attribute_json_dir = out_dir / "attribute_json"
-    fake_cache_dir = out_dir / "cache" / "fake_desc"
-
-    done_ids = _load_ids(modifications_path)
-    writer = DeepSeekAttributeWriter()
-    with (
-        items_path.open(encoding="utf-8") as items_file,
-        modifications_path.open("a", encoding="utf-8") as modifications_file,
-    ):
-        for line in items_file:
-            if not line.strip():
-                continue
-            item = json.loads(line)
-            item_id = str(item["item_id"])
-            if item_id in done_ids:
-                continue
-            attributes = json.loads(
-                (attribute_json_dir / f"{item_id}.json").read_text(encoding="utf-8")
-            )["attributes"]
-            try:
-                modification = build_modification(
-                    item["features"], item_id, attributes, writer, fake_cache_dir
-                )
-            except ValueError as error:
-                logger.warning("skipping modification for %s: %s", item_id, error)
-                continue
-            if modification is None:
-                logger.info("skipping modification for %s: no fakeable attributes found", item_id)
-                continue
-            modifications_file.write(json.dumps(dataclasses.asdict(modification), ensure_ascii=False) + "\n")
-
-
 def build_dataset(
     source_path: Path,
     catalog_path: Path,
@@ -85,26 +93,24 @@ def build_dataset(
     count: int,
     offset: int = 0,
     resume: bool = False,
-    skip_modifications: bool = False,
 ) -> None:
     if count < 1:
         raise ValueError("count must be positive")
     if offset < 0:
         raise ValueError("offset must be non-negative")
-    samples = load_jsonl(source_path)[offset : offset + count]
+    samples = _label_v2_samples(_load_jsonl(source_path))[offset : offset + count]
 
-    items_path = out_dir / "items.jsonl"
-    modifications_path = out_dir / "modifications.jsonl"
+    dataset_path = out_dir / DATASET_NAME
     already_done = 0
-    if resume and items_path.is_file():
-        with items_path.open(encoding="utf-8") as handle:
+    if resume and dataset_path.is_file():
+        with dataset_path.open(encoding="utf-8") as handle:
             already_done = sum(1 for line in handle if line.strip())
     if already_done:
         logger.info("resuming: skipping %d already-generated items", already_done)
     samples = samples[already_done:]
     file_mode = "a" if already_done else "w"
 
-    target_ids = {str(sample["ground_truth"]["parent_asin"]) for sample in samples}
+    target_ids = {str(sample[0]["ground_truth"]["parent_asin"]) for sample in samples}
     products = _load_catalog_products(catalog_path, target_ids)
 
     writer = DeepSeekAttributeWriter()
@@ -116,11 +122,8 @@ def build_dataset(
     intent_cache_dir = out_dir / "cache" / "intent_desc"
     fake_cache_dir = out_dir / "cache" / "fake_desc"
 
-    with (
-        items_path.open(file_mode, encoding="utf-8") as items_file,
-        modifications_path.open(file_mode, encoding="utf-8") as modifications_file,
-    ):
-        for sample in samples:
+    with dataset_path.open(file_mode, encoding="utf-8") as dataset_file:
+        for sample, intent, override in samples:
             item_id = str(sample["ground_truth"]["parent_asin"])
             product = products.get(item_id)
             if product is None:
@@ -149,21 +152,20 @@ def build_dataset(
             )
 
             item = build_item(product, attributes, writer, intent_cache_dir)
-            items_file.write(json.dumps(dataclasses.asdict(item), ensure_ascii=False) + "\n")
-
-            if skip_modifications:
-                continue
-            try:
-                modification = build_modification(
-                    product, item.item_id, attributes, writer, fake_cache_dir
-                )
-            except ValueError as error:
-                logger.warning("skipping modification for %s: %s", item_id, error)
-                continue
+            modification = build_modification(
+                product, item.item_id, attributes, writer, fake_cache_dir
+            )
             if modification is None:
-                logger.info("skipping modification for %s: no fakeable attributes found", item_id)
-                continue
-            modifications_file.write(json.dumps(dataclasses.asdict(modification), ensure_ascii=False) + "\n")
+                if override:
+                    raise ValueError(f"override sample {sample['sample_id']} has no fakeable attributes")
+                logger.info("%s has no fakeable attributes", item_id)
+            dataset_file.write(
+                json.dumps(
+                    _v2_row(sample, intent, override, item, modification),
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
 
 def main() -> None:
@@ -172,7 +174,7 @@ def main() -> None:
     )
     parser.add_argument("--source", default="data/public_set.jsonl")
     parser.add_argument("--catalog", default="data/catalog.jsonl")
-    parser.add_argument("--out-dir", default="data/custom")
+    parser.add_argument("--out-dir", default="data")
     parser.add_argument("--count", type=int, default=10)
     parser.add_argument(
         "--offset",
@@ -183,23 +185,10 @@ def main() -> None:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Skip items already written to items.jsonl and append instead of overwriting.",
-    )
-    parser.add_argument(
-        "--skip-modifications",
-        action="store_true",
-        help="Only generate items.jsonl; do not call the LLM for modification data.",
-    )
-    parser.add_argument(
-        "--modifications-only",
-        action="store_true",
-        help="Backfill modifications.jsonl for items already in items.jsonl that lack one, then exit.",
+        help=f"Append after rows already written to {DATASET_NAME}.",
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    if args.modifications_only:
-        backfill_modifications(Path(args.out_dir))
-        return
     build_dataset(
         Path(args.source),
         Path(args.catalog),
@@ -207,7 +196,6 @@ def main() -> None:
         args.count,
         args.offset,
         args.resume,
-        args.skip_modifications,
     )
 
 

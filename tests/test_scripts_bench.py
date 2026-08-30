@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -11,6 +12,7 @@ from scripts.attributes import (
     price_band,
     verify_extraction,
 )
+from scripts.build_dataset import _label_v2_samples, _v2_row
 from scripts.llm_client import DeepSeekAttributeWriter, cached_json_call
 from scripts.modification import _conflicts_with_truth, build_modification
 from scripts.query_handler import ACTIVE_ATTRIBUTE_COUNT, QueryHandler
@@ -76,6 +78,34 @@ class FakeWriter:
                 for stage in ("browsing", "buying")
             },
         }
+
+
+class DatasetExportTest(unittest.TestCase):
+    def test_v2_export_flattens_item_and_modification_fields(self) -> None:
+        sample = {
+            "sample_id": "sample_1",
+            "scenario_type": "intent_override",
+            "ground_truth": {"parent_asin": "A"},
+        }
+        item = Item(
+            item_id="A",
+            features={"parent_asin": "A"},
+            intent_descriptions={"browsing": {}, "buying": {}},
+        )
+        modification = Modification(
+            item_id="A",
+            fake_attributes={"style": {"browsing": "fake", "buying": "fake"}},
+            correction_messages={"style": {"browsing": "true", "buying": "true"}},
+            modify_turn=3,
+        )
+        [(labeled_sample, intent, override)] = _label_v2_samples([sample])
+        row = _v2_row(labeled_sample, intent, override, item, modification)
+        self.assertEqual(row["version"], "v2")
+        self.assertEqual(row["intent"], "buying")
+        self.assertTrue(row["override"])
+        self.assertNotIn("scenario_type", row)
+        self.assertEqual(row["item_id"], "A")
+        self.assertEqual(row["modify_turn"], 3)
 
 
 class PriceBandTest(unittest.TestCase):
@@ -390,13 +420,12 @@ class DeepSeekAttributeWriterTest(unittest.TestCase):
     def test_missing_api_key_raises(self) -> None:
         import os
 
-        original = os.environ.pop("DEEPSEEK_API_KEY", None)
-        try:
+        with (
+            patch("scripts.llm_client._load_dotenv"),
+            patch.dict(os.environ, {"DEEPSEEK_API_KEY": ""}),
+        ):
             with self.assertRaises(RuntimeError):
                 DeepSeekAttributeWriter()
-        finally:
-            if original is not None:
-                os.environ["DEEPSEEK_API_KEY"] = original
 
     def test_parse_requires_both_stages_and_attributes(self) -> None:
         valid = json.dumps({"browsing": {"material": "soft-ish", "feature": "stretch"}, "buying": {"material": "cotton blend", "feature": "stretchy"}})
