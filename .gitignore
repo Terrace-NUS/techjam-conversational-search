@@ -19,3 +19,5 @@ docs/participant_release_checklist.md
 tests/test_5core_builder.py
 tests/test_organizer_pipeline.py
 *.log
+data/custom/
+data/custom_retry_B08ZKFD4GM
