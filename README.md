@@ -43,6 +43,26 @@ python3 -m evaluator.local_evaluator
 Edit `starter/agent.py` to implement your system. Do not edit the evaluator or public labels when reporting your local score.
 The command writes per-session results and aggregate metrics to `results.json`.
 
+## Optional Cross-Session Memory
+
+The standard-library-only `threadline_memory` package persists one JSON profile
+per user and exposes a small host-facing API:
+
+```python
+from threadline_memory import MemoryService
+
+memory = MemoryService.from_json_directory("data/memory")
+started = memory.start_session(user_id, session_id, initial_profile=user_profile)
+updated = memory.update_from_dialogue(user_id, session_id, messages)
+
+agent.reset(session_id, updated.profile_prior)
+ranking_profile = updated.ranking_user_profile
+```
+
+`start_session` is idempotent for a `(user_id, session_id)` pair, and dialogue
+updates reject sessions that were not first started for that user. Persistent
+profile files and API credentials should not be committed.
+
 The included weak BM25 starter scores Hit Rate@10 `0.125`, MRR `0.068034`, and
 MTTC `9.81` on the released public set. See `docs/baseline_results.json`.
 
