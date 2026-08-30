@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "source": "public_set distribution vs frozen catalog",
+  "public_sample_count": 200,
+  "weights": {
+    "rating": {
+      "3.5_to_3.99": -0.504554,
+      "4.0_to_4.49": 0.313707,
+      "4.5_plus": 0.241131
+    },
+    "reviews": {
+      "1000_plus": 3.0,
+      "10_to_49": -0.862413,
+      "200_to_999": 0.325652,
+      "50_to_199": -0.38251
+    },
+    "price": {
+      "10_to_25": 1.417146,
+      "25_to_50": 1.596144,
+      "50_to_100": 0.822154,
+      "missing_or_invalid": -1.436483,
+      "up_to_10": 0.408935
+    },
+    "material": {
+      "cotton": 0.251829,
+      "fabric": 0.30243,
+      "leather": -0.039465,
+      "none": -0.537101,
+      "nylon": 0.260175,
+      "polyester": 0.280518,
+      "rayon": 0.456695,
+      "spandex": 0.169853,
+      "wool": 0.162482
+    },
+    "color": {
+      "black": -0.302511,
+      "grey": -0.116363,
+      "none": 0.20108,
+      "pink": -0.029109,
+      "red": -0.018438,
+      "white": -0.262324
+    },
+    "category": {
+      "belts": -0.0672,
+      "blouses & button-down shirts": -0.333127,
+      "bodysuits": 0.07142,
+      "briefs": 0.379764,
+      "casual": -0.459531,
+      "dresses": -0.318972,
+      "everyday bras": 0.108141,
+      "fashion hoodies & sweatshirts": -0.238987,
+      "fashion sneakers": -0.462312,
+      "jeans": -0.163417,
+      "leggings": -0.13646,
+      "loafers & slip-ons": -0.320009,
+      "mules & clogs": -0.090233,
+      "sets": -0.299176,
+      "sleep bottoms": 0.29564,
+      "slippers": -0.176563,
+      "t-shirts": -0.900182,
+      "tunics": -0.162828,
+      "undershirts": 0.400356,
+      "walking": 0.080984,
+      "wallets": -0.163113,
+      "wrist watches": -0.442919
+    },
+    "card_types": {
+      "feature-color-feature-feature": -0.988819,
+      "feature-feature-feature-feature": -0.971004,
+      "material-color-feature-feature": -0.591193,
+      "material-color-material-feature": -1.119723,
+      "material-feature-feature-feature": -0.382942,
+      "material-feature-feature-material": -0.231465,
+      "material-material-feature-feature": -0.673298,
+      "material-material-feature-material": -0.439055
+    },
+    "card_length": {
+      "4": 0.022623
+    },
+    "has_features": {
+      "true": 0.101244
+    },
+    "has_details": {
+      "true": 0.027911
+    },
+    "has_description": {
+      "false": 0.138907,
+      "true": -0.145764
+    }
+  }
+}
