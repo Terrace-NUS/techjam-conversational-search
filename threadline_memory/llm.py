@@ -19,7 +19,18 @@ import os
 import re
 from typing import Any, Protocol, runtime_checkable
 
-from .prompt import SYSTEM_PROMPT, build_user_payload
+from .prompt import (
+    CORRECTION_AUDIT_PROMPT,
+    SYSTEM_PROMPT,
+    build_correction_audit_payload,
+    build_user_payload,
+)
+
+_CORRECTION_SIGNAL = re.compile(
+    r"\b(?:actually|correction|correct(?:ing)?\s+(?:that|my)|i meant|instead|sorry[, ]+i meant|not)\b"
+    r"|更正|纠正|改成|不是|而是",
+    re.IGNORECASE,
+)
 
 
 @runtime_checkable
@@ -122,14 +133,25 @@ def _strip_code_fence(text: str) -> str:
     return text.strip()
 
 
+def _has_correction_signal(messages: list[dict[str, str]]) -> bool:
+    return any(
+        message.get("role") == "user"
+        and bool(_CORRECTION_SIGNAL.search(message.get("content", "")))
+        for message in messages
+    )
+
+
 class DeepSeekProfileUpdateClient:
     """DeepSeek chat-completions client configured from the environment.
 
     Environment variables (all optional except the key at call time):
     ``DEEPSEEK_API_KEY``, ``DEEPSEEK_BASE_URL`` (default
     ``https://api.deepseek.com``), ``DEEPSEEK_MODEL`` (default
-    ``deepseek-chat``). Import never touches the network.
+    ``deepseek-v4-flash``). Import never touches the network.
     """
+
+    DEFAULT_MODEL = "deepseek-v4-flash"
+    DEFAULT_BASE_URL = "https://api.deepseek.com"
 
     def __init__(
         self,
@@ -137,12 +159,13 @@ class DeepSeekProfileUpdateClient:
         api_key: str | None = None,
         base_url: str | None = None,
         model: str | None = None,
-        timeout: float = 30.0,
+        timeout: float = 60.0,
     ) -> None:
         self._api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
-        self._base_url = (base_url or os.environ.get("DEEPSEEK_BASE_URL")
-                          or "https://api.deepseek.com").rstrip("/")
-        self._model = model or os.environ.get("DEEPSEEK_MODEL") or "deepseek-chat"
+        self._base_url = (
+            base_url or os.environ.get("DEEPSEEK_BASE_URL") or self.DEFAULT_BASE_URL
+        ).rstrip("/")
+        self._model = model or os.environ.get("DEEPSEEK_MODEL") or self.DEFAULT_MODEL
         self._timeout = timeout
 
     def extract_profile_patch(
@@ -152,21 +175,40 @@ class DeepSeekProfileUpdateClient:
     ) -> dict[str, object]:
         if not self._api_key:
             raise RuntimeError("DEEPSEEK_API_KEY is not set")
-        raw = self._call(build_user_payload(dict(current_profile), list(messages)))
+        dialogue = list(messages)
+        raw = self._call(build_user_payload(dict(current_profile), dialogue))
         try:
             parsed = json.loads(_strip_code_fence(raw))
         except json.JSONDecodeError:
             return {}
-        return parsed if isinstance(parsed, dict) else {}
+        if not isinstance(parsed, dict):
+            return {}
+        if _has_correction_signal(dialogue):
+            try:
+                audit_raw = self._chat(
+                    CORRECTION_AUDIT_PROMPT,
+                    build_correction_audit_payload(dialogue, parsed),
+                )
+                audit = json.loads(_strip_code_fence(audit_raw))
+                corrections = audit.get("corrections") if isinstance(audit, dict) else None
+                if isinstance(corrections, list):
+                    parsed["corrections"] = corrections
+            except (KeyError, TypeError, json.JSONDecodeError, OSError):
+                # The first extraction remains useful if the optional audit fails.
+                pass
+        return parsed
 
     def _call(self, user_content: str) -> str:  # pragma: no cover - network path
+        return self._chat(SYSTEM_PROMPT, user_content)
+
+    def _chat(self, system_prompt: str, user_content: str) -> str:  # pragma: no cover
         import urllib.request
 
         body = json.dumps(
             {
                 "model": self._model,
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
                 "temperature": 0.0,

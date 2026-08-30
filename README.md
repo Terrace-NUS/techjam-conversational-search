@@ -63,6 +63,24 @@ ranking_profile = updated.ranking_user_profile
 updates reject sessions that were not first started for that user. Persistent
 profile files and API credentials should not be committed.
 
+For full-model extraction, construct `DeepSeekProfileUpdateClient` and set
+`DEEPSEEK_API_KEY`. Its default model is `deepseek-v4-flash`; correction-like
+dialogue gets a second, focused audit so superseded preferences are replaced or
+retracted instead of accumulated. Configuration examples are in `.env.example`.
+
+The benchmark runner is included at `examples/run_public_sessions.py`. It reads
+API configuration from the environment and accepts an external checkout of the
+simulator implementation:
+
+```bash
+python examples/run_public_sessions.py \
+  --dataset data/public_set_v2.jsonl \
+  --simulator-root ../techjam-new-intent-design-latest \
+  --output results/public_sessions_50.json \
+  --memory-dir data/memory-benchmark \
+  --limit 50 --balanced --workers 5
+```
+
 The included weak BM25 starter scores Hit Rate@10 `0.125`, MRR `0.068034`, and
 MTTC `9.81` on the released public set. See `docs/baseline_results.json`.
 

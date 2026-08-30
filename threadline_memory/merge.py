@@ -17,14 +17,36 @@ Merge principles (mirrors the product rules):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .schema import normalize_base_profile, preference_sections
+from .schema import preference_sections
 
 VALID_SOURCES = ("explicit", "repeated_behavior", "inferred")
 VALID_POLARITIES = ("positive", "negative")
 _INFERRED_CONFIDENCE_CAP = 0.6
+
+# A product id is an Amazon-style ASIN: exactly 10 uppercase alphanumerics.
+# Brand names and free text never match, so this rejects brand-as-id noise.
+_ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
+
+# Top-level patch keys the merger recognizes. base_profile is listed so it does
+# not trip the unknown-key warning, but it is still rejected as frozen history.
+_KNOWN_PATCH_KEYS = frozenset(
+    {
+        "base_profile",
+        "occupation",
+        "interests",
+        "preferences",
+        "shopping_preferences",
+        "recipient_cards",
+        "purchase_anchors",
+        "episode_seeds",
+        "corrections",
+        "deletions",
+    }
+)
 
 # Key that identifies "the same preference" within a section, for correction.
 _SECTION_KEYS: dict[str, str] = {
@@ -69,6 +91,43 @@ def _str(value: Any) -> str | None:
     return None
 
 
+def _scalar_text(value: Any) -> str | None:
+    """Like ``_str`` but also stringifies a plain number (e.g. a bare price)."""
+
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return f"{value:g}"
+    return None
+
+
+def _normalize_price_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Coerce loose price shapes into a standard preference item.
+
+    The LLM emits price inconsistently: a bare number, a ``budget``/``amount``
+    cap, or ``min``/``max`` bounds. Normalize all of them to a ``budget``
+    subject with a human-readable ``value`` so a valid entry survives the merge
+    instead of being dropped as malformed.
+    """
+
+    out = dict(item)
+    out.setdefault("subject", "budget")
+    if _scalar_text(out.get("value")) is not None:
+        return out
+    low = _scalar_text(out.get("min", out.get("min_price")))
+    high = _scalar_text(out.get("max", out.get("max_price")))
+    cap = _scalar_text(out.get("budget", out.get("amount")))
+    if low and high:
+        out["value"] = f"${low}-${high}"
+    elif high or cap:
+        out["value"] = f"under ${high or cap}"
+    elif low:
+        out["value"] = f"over ${low}"
+    return out
+
+
 def merge_patch(profile: dict[str, Any], patch: Any) -> MergeOutcome:
     """Return a new profile with the valid parts of ``patch`` applied."""
 
@@ -80,10 +139,29 @@ def merge_patch(profile: dict[str, Any], patch: Any) -> MergeOutcome:
         outcome.warnings.append("patch: not an object; ignored")
         return outcome
 
-    _merge_base_profile(result, patch.get("base_profile"), outcome)
+    patch = dict(patch)
+    alias = patch.get("shopping_preferences")
+    if alias is not None:
+        if "preferences" not in patch and isinstance(alias, dict):
+            patch["preferences"] = alias
+            outcome.warnings.append(
+                "patch: normalized top-level 'shopping_preferences' alias to 'preferences'"
+            )
+        else:
+            outcome.warnings.append(
+                "patch: ignored top-level 'shopping_preferences' alias because "
+                "'preferences' already exists or the alias is not an object"
+            )
+
+    for key in patch:
+        if key not in _KNOWN_PATCH_KEYS:
+            outcome.warnings.append(f"patch: unknown top-level key {key!r}; ignored")
+
+    _reject_base_profile(patch.get("base_profile"), outcome)
     _merge_occupation(result, patch.get("occupation"), outcome)
     _merge_interests(result, patch.get("interests"), outcome)
     _merge_preferences(result, patch.get("preferences"), outcome)
+    _apply_corrections(result, patch.get("corrections"), outcome)
     _merge_recipient_cards(result, patch.get("recipient_cards"), outcome)
     _merge_purchase_anchors(result, patch.get("purchase_anchors"), outcome)
     _merge_episode_seeds(result, patch.get("episode_seeds"), outcome)
@@ -91,21 +169,21 @@ def merge_patch(profile: dict[str, Any], patch: Any) -> MergeOutcome:
     return outcome
 
 
-def _merge_base_profile(profile: dict[str, Any], raw: Any, outcome: MergeOutcome) -> None:
+def _reject_base_profile(raw: Any, outcome: MergeOutcome) -> None:
+    """base_profile is the frozen historical seed; dialogue can never rewrite it.
+
+    It is initialized once from the dataset ``user_profile`` at
+    ``start_session``. Current-turn signals must land in structured
+    ``preferences.*`` (or interests/occupation), never in the history summary or
+    tags — otherwise this-session facts masquerade as long-term history.
+    """
+
     if raw is None:
         return
-    if not isinstance(raw, dict):
-        outcome.warnings.append("base_profile: not an object; ignored")
-        return
-    base = profile["base_profile"]
-    incoming = normalize_base_profile({**base, **raw})
-    # preference_tags are unioned rather than replaced, preserving history.
-    tags = list(dict.fromkeys([*base.get("preference_tags", []), *incoming["preference_tags"]]))
-    incoming["preference_tags"] = tags
-    for key, value in incoming.items():
-        if base.get(key) != value:
-            base[key] = value
-            outcome.changed_fields.append(f"base_profile.{key}")
+    outcome.warnings.append(
+        "base_profile: frozen against dialogue patches; route current-turn "
+        "signals to preferences.*/interests/occupation instead; ignored"
+    )
 
 
 def _merge_occupation(profile: dict[str, Any], raw: Any, outcome: MergeOutcome) -> None:
@@ -182,7 +260,7 @@ def _preference_entry(
     source = _norm_source(item.get("source"), outcome.warnings, f"preferences.{section}[]")
     if source is None:
         return None
-    value = _str(item.get("value"))
+    value = _scalar_text(item.get("value"))
     subject = _str(item.get("subject")) or value
     if value is None and subject is None:
         outcome.warnings.append(f"preferences.{section}[]: missing value/subject; skipped")
@@ -220,6 +298,10 @@ def _merge_preferences(profile: dict[str, Any], raw: Any, outcome: MergeOutcome)
         outcome.warnings.append("preferences: not an object; ignored")
         return
     prefs = profile["shopping_preferences"]
+    valid_sections = set(preference_sections())
+    for key in raw:
+        if key not in valid_sections:
+            outcome.warnings.append(f"preferences: unknown section {key!r}; ignored")
     for section in preference_sections():
         items = raw.get(section)
         if items is None:
@@ -231,11 +313,86 @@ def _merge_preferences(profile: dict[str, Any], raw: Any, outcome: MergeOutcome)
             if not isinstance(item, dict):
                 outcome.warnings.append(f"preferences.{section}[]: not an object; skipped")
                 continue
+            if section == "price":
+                item = _normalize_price_item(item)
             entry = _preference_entry(section, item, outcome)
             if entry is None:
                 continue
             if _upsert_preference(prefs[section], section, entry):
                 outcome.changed_fields.append(f"shopping_preferences.{section}")
+
+
+def _normalized_value(value: Any) -> str:
+    text = _scalar_text(value) or ""
+    return re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+
+
+def _same_value(left: Any, right: Any) -> bool:
+    a = _normalized_value(left)
+    b = _normalized_value(right)
+    return bool(a and b and (a == b or a in b or b in a))
+
+
+def _apply_corrections(profile: dict[str, Any], raw: Any, outcome: MergeOutcome) -> None:
+    """Apply explicit final-state corrections after merging the draft preferences."""
+
+    if raw is None:
+        return
+    if not isinstance(raw, list):
+        outcome.warnings.append("corrections: not a list; ignored")
+        return
+    allowed_sections = set(preference_sections()) - {"negative_preferences"}
+    prefs = profile["shopping_preferences"]
+    for item in raw:
+        if not isinstance(item, dict):
+            outcome.warnings.append("corrections[]: not an object; skipped")
+            continue
+        section = _str(item.get("section"))
+        subject = _str(item.get("subject"))
+        final_value = _scalar_text(item.get("final_value"))
+        evidence = _str(item.get("evidence"))
+        superseded = item.get("superseded_values")
+        if (
+            section not in allowed_sections
+            or subject is None
+            or evidence is None
+            or item.get("source") != "explicit"
+            or not isinstance(superseded, list)
+        ):
+            outcome.warnings.append("corrections[]: invalid explicit correction; skipped")
+            continue
+        old_values = [value for value in superseded if _scalar_text(value)]
+        if not old_values:
+            outcome.warnings.append("corrections[]: no superseded values; skipped")
+            continue
+        bucket = prefs[section]
+        kept: list[dict[str, Any]] = []
+        for entry in bucket:
+            is_old = any(_same_value(entry.get("value"), old) for old in old_values)
+            same_subject = _same_value(entry.get("subject"), subject)
+            is_final = final_value is not None and _same_value(entry.get("value"), final_value)
+            if (is_old or same_subject) and not is_final:
+                outcome.changed_fields.append(
+                    f"-shopping_preferences.{section}[{entry.get('value')}]"
+                )
+            else:
+                kept.append(entry)
+        bucket[:] = kept
+        if final_value is None:
+            continue
+        final_item: dict[str, Any] = {
+            "subject": subject,
+            "value": final_value,
+            "polarity": "positive",
+            "confidence": item.get("confidence", 0.9),
+            "source": "explicit",
+            "evidence": evidence,
+        }
+        if section == "price":
+            final_item = _normalize_price_item(final_item)
+        final_entry = _preference_entry(section, final_item, outcome)
+        if final_entry is not None and _upsert_preference(bucket, section, final_entry):
+            outcome.changed_fields.append(f"shopping_preferences.{section}")
 
 
 def _merge_recipient_cards(profile: dict[str, Any], raw: Any, outcome: MergeOutcome) -> None:
@@ -386,11 +543,30 @@ def _merge_episode_seeds(profile: dict[str, Any], raw: Any, outcome: MergeOutcom
         return
     seeds: list[dict[str, Any]] = profile["episode_seeds"]
     seen = {s.get("anchor_product_id") for s in seeds if isinstance(s, dict)}
+    # A seed continues a real prior purchase, so its anchor must be a product id
+    # that already exists as a self purchase_anchor (merged earlier this call).
+    anchor_ids = {
+        a.get("product_id")
+        for a in profile.get("purchase_anchors", [])
+        if isinstance(a, dict)
+    }
     for item in raw:
         if not isinstance(item, dict):
             continue
         anchor = _str(item.get("anchor_product_id"))
         if anchor is None or anchor in seen:
+            continue
+        if not _ASIN_RE.match(anchor):
+            outcome.warnings.append(
+                f"episode_seeds[{anchor!r}]: anchor_product_id is not a product id "
+                "(expected a 10-char ASIN); looks like a brand/name; skipped"
+            )
+            continue
+        if anchor not in anchor_ids:
+            outcome.warnings.append(
+                f"episode_seeds[{anchor}]: no matching purchase_anchor; a seed needs "
+                "a real purchased anchor; skipped"
+            )
             continue
         seen.add(anchor)
         seeds.append(
