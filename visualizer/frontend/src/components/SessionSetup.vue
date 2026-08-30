@@ -1,0 +1,119 @@
+<script setup lang="ts">
+import { computed, ref, watch } from 'vue'
+import { Play } from '@lucide/vue'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import type { SampleSummary } from '@/types'
+
+const props = defineProps<{
+  samples: SampleSummary[]
+  loading: boolean
+}>()
+
+const emit = defineEmits<{
+  start: [sampleId: string]
+}>()
+
+const scenario = ref('all')
+const selectedId = ref('')
+
+const scenarios = computed(() => [
+  'all',
+  ...new Set(props.samples.map((sample) => sample.scenario_type)),
+])
+
+const filteredSamples = computed(() =>
+  scenario.value === 'all'
+    ? props.samples
+    : props.samples.filter((sample) => sample.scenario_type === scenario.value),
+)
+
+watch(
+  filteredSamples,
+  (samples) => {
+    if (!samples.some((sample) => sample.sample_id === selectedId.value)) {
+      selectedId.value = samples[0]?.sample_id ?? ''
+    }
+  },
+  { immediate: true },
+)
+</script>
+
+<template>
+  <Card class="w-full max-w-2xl border-0 shadow-xl shadow-slate-200/60 dark:shadow-black/30">
+    <CardHeader class="space-y-3">
+      <div class="flex items-center gap-2">
+        <Badge variant="secondary">Human as Agent</Badge>
+        <Badge variant="outline">Template simulator</Badge>
+      </div>
+      <CardTitle class="text-2xl">Start a product-guessing session</CardTitle>
+      <CardDescription class="max-w-xl leading-6">
+        You will see exactly what an Agent sees. Ask one structured question, rank up to
+        ten products, and find the hidden target within ten turns.
+      </CardDescription>
+    </CardHeader>
+    <CardContent class="space-y-5">
+      <div class="grid gap-4 sm:grid-cols-2">
+        <div class="grid gap-2 text-sm font-medium">
+          <label for="scenario-select">Scenario</label>
+          <Select v-model="scenario">
+            <SelectTrigger id="scenario-select" class="w-full">
+              <SelectValue placeholder="Choose a scenario" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem v-for="item in scenarios" :key="item" :value="item">
+                {{ item === 'all' ? 'All scenarios' : item.replaceAll('_', ' ') }}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div class="grid gap-2 text-sm font-medium">
+          <label for="sample-select">Public case</label>
+          <Select v-model="selectedId">
+            <SelectTrigger id="sample-select" class="w-full">
+              <SelectValue placeholder="Choose a public case" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem
+                v-for="sample in filteredSamples"
+                :key="sample.sample_id"
+                :value="sample.sample_id"
+              >
+                {{ sample.sample_id }} · {{ sample.difficulty_bucket }}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <div class="rounded-lg border bg-muted/40 p-4 text-sm text-muted-foreground">
+        The target and simulator intent remain hidden until the session ends.
+      </div>
+
+      <Button
+        class="w-full"
+        size="lg"
+        :disabled="loading || !selectedId"
+        @click="emit('start', selectedId)"
+      >
+        <Play class="size-4" />
+        {{ loading ? 'Starting…' : 'Start session' }}
+      </Button>
+    </CardContent>
+  </Card>
+</template>

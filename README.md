@@ -42,6 +42,31 @@ uv sync
 uv run python -m evaluator.local_evaluator --progress
 ```
 
+## Run the Simulator Visualizer
+
+The first visualizer mode lets you play the Agent against the same deterministic
+Simulator rules used by the local evaluator. The FastAPI backend shares this
+project's `uv` environment.
+
+```bash
+uv sync
+cd visualizer/frontend
+pnpm install
+cd ../..
+```
+
+Then start both servers with one command:
+
+```bash
+uv run python scripts/visualizer.py
+# Enable backend hot reload; Vite already hot-reloads the frontend.
+uv run python scripts/visualizer.py --reload
+```
+
+Open `http://localhost:5173`. Choose a public case, write the Agent message and
+`ask_attribute`, then search and rank up to ten catalog products. The hidden
+target is only revealed after a hit or turn 10.
+
 Agent implementations are selected with `--agent baseline|v1` (or
 `TECHJAM_AGENT`). `baseline` is the original BM25 starter; `v1` is the
 offline structured-retrieval implementation in `starter/v1/`.
