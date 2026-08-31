@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -11,9 +12,10 @@ from scripts.attributes import (
     price_band,
     verify_extraction,
 )
+from scripts.build_dataset import _label_v2_samples, _v2_row
 from scripts.llm_client import DeepSeekAttributeWriter, cached_json_call
 from scripts.modification import _conflicts_with_truth, build_modification
-from scripts.query_handler import ACTIVE_ATTRIBUTE_COUNT, QueryHandler
+from scripts.query_handler import QueryHandler
 from scripts.session import create_session
 from scripts.schema import Item
 from scripts.schema import Modification
@@ -78,6 +80,34 @@ class FakeWriter:
         }
 
 
+class DatasetExportTest(unittest.TestCase):
+    def test_v2_export_flattens_item_and_modification_fields(self) -> None:
+        sample = {
+            "sample_id": "sample_1",
+            "scenario_type": "intent_override",
+            "ground_truth": {"parent_asin": "A"},
+        }
+        item = Item(
+            item_id="A",
+            features={"parent_asin": "A"},
+            intent_descriptions={"browsing": {}, "buying": {}},
+        )
+        modification = Modification(
+            item_id="A",
+            fake_attributes={"style": {"browsing": "fake", "buying": "fake"}},
+            correction_messages={"style": {"browsing": "true", "buying": "true"}},
+            modify_turn=3,
+        )
+        [(labeled_sample, intent, override)] = _label_v2_samples([sample])
+        row = _v2_row(labeled_sample, intent, override, item, modification)
+        self.assertEqual(row["version"], "v2")
+        self.assertEqual(row["intent"], "buying")
+        self.assertTrue(row["override"])
+        self.assertNotIn("scenario_type", row)
+        self.assertEqual(row["item_id"], "A")
+        self.assertEqual(row["modify_turn"], 3)
+
+
 class PriceBandTest(unittest.TestCase):
     def test_price_band_boundaries(self) -> None:
         self.assertEqual(price_band(10), "under_15")
@@ -100,44 +130,31 @@ class QueryHandlerTest(unittest.TestCase):
         }
         return Item("ITEM", {}, descriptions)
 
-    def test_selects_exactly_four_attributes_deterministically(self) -> None:
-        first = QueryHandler("session-1", self._item())
-        second = QueryHandler("session-1", self._item())
-        self.assertEqual(first.active_attributes, second.active_attributes)
-        self.assertEqual(len(first.active_attributes), ACTIVE_ATTRIBUTE_COUNT)
+    def test_all_available_attributes_are_active(self) -> None:
+        handler = QueryHandler("session-1", self._item())
+        self.assertEqual(
+            handler.active_attributes,
+            ("brand", "budget", "category", "feature", "material", "other"),
+        )
 
     def test_active_other_returns_only_other_description(self) -> None:
         handler = QueryHandler("session-2", self._item())
-        handler.active_attributes = (*handler.active_attributes[:-1], "other")
         result = handler.answer("other")
         self.assertEqual(result, "browsing:other")
         self.assertEqual(len(handler.disclosed_attributes), 1)
 
-    def test_inactive_other_does_not_reveal_another_attribute(self) -> None:
-        handler = next(
-            QueryHandler(f"session-inactive-other-{index}", self._item())
-            for index in range(100)
-            if "other" not in QueryHandler(
-                f"session-inactive-other-{index}", self._item()
-            ).active_attributes
-        )
-        self.assertNotIn("other", handler.active_attributes)
-        self.assertIsNone(handler.answer("other"))
-        self.assertEqual(handler.disclosed_attributes, set())
-
-    def test_inactive_attribute_is_not_revealed(self) -> None:
+    def test_unknown_attribute_is_not_revealed(self) -> None:
         handler = QueryHandler("session-3", self._item())
-        inactive = next(name for name in ("category", "brand", "budget", "material", "feature", "other") if name not in handler.active_attributes)
-        self.assertIsNone(handler.answer(inactive))
+        self.assertIsNone(handler.answer("unknown"))
 
-    def test_fewer_than_four_attributes_is_rejected(self) -> None:
+    def test_fewer_than_four_attributes_are_all_active(self) -> None:
         item = Item(
             "ITEM_WITH_THREE_ATTRIBUTES",
             {},
             {"browsing": {"category": "shirts", "brand": "Acme", "budget": "under $30"}},
         )
-        with self.assertRaises(ValueError):
-            QueryHandler("session-4", item)
+        handler = QueryHandler("session-4", item)
+        self.assertEqual(handler.active_attributes, ("brand", "budget", "category"))
 
     def test_modification_switches_fake_to_true_and_corrects_prior_disclosure(self) -> None:
         item = Item(
@@ -390,13 +407,12 @@ class DeepSeekAttributeWriterTest(unittest.TestCase):
     def test_missing_api_key_raises(self) -> None:
         import os
 
-        original = os.environ.pop("DEEPSEEK_API_KEY", None)
-        try:
+        with (
+            patch("scripts.llm_client._load_dotenv"),
+            patch.dict(os.environ, {"DEEPSEEK_API_KEY": ""}),
+        ):
             with self.assertRaises(RuntimeError):
                 DeepSeekAttributeWriter()
-        finally:
-            if original is not None:
-                os.environ["DEEPSEEK_API_KEY"] = original
 
     def test_parse_requires_both_stages_and_attributes(self) -> None:
         valid = json.dumps({"browsing": {"material": "soft-ish", "feature": "stretch"}, "buying": {"material": "cotton blend", "feature": "stretchy"}})
