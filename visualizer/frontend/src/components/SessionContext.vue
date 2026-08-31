@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import { RotateCcw, Target } from '@lucide/vue'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -6,8 +7,12 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Separator } from '@/components/ui/separator'
 import type { SimulatorSession } from '@/types'
 
-defineProps<{ session: SimulatorSession }>()
+const props = defineProps<{ session: SimulatorSession }>()
 defineEmits<{ reset: [] }>()
+
+const targetProduct = computed(
+  () => props.session.outcome?.target_product ?? props.session.debug_target_product,
+)
 </script>
 
 <template>
@@ -43,33 +48,38 @@ defineEmits<{ reset: [] }>()
       </CardContent>
     </Card>
 
-    <Card v-if="session.outcome" :class="session.outcome.hit ? 'border-emerald-300 dark:border-emerald-800' : 'border-amber-300 dark:border-amber-800'">
+    <Card
+      v-if="targetProduct"
+      :class="session.outcome?.hit ? 'border-emerald-300 dark:border-emerald-800' : session.outcome ? 'border-amber-300 dark:border-amber-800' : 'border-sky-300 dark:border-sky-800'"
+    >
       <CardHeader>
         <div class="flex items-center gap-2">
           <Target class="size-4" />
-          <CardTitle class="text-base">Hidden target revealed</CardTitle>
+          <CardTitle class="text-base">
+            {{ session.outcome ? 'Hidden target revealed' : 'Debug target' }}
+          </CardTitle>
         </div>
       </CardHeader>
       <CardContent class="space-y-2 text-sm">
         <div class="flex items-start gap-3">
           <img
-            v-if="session.outcome.target_product.thumb"
-            :src="session.outcome.target_product.thumb"
+            v-if="targetProduct.thumb"
+            :src="targetProduct.thumb"
             alt=""
             class="size-14 shrink-0 rounded-lg border bg-white object-contain p-1"
             referrerpolicy="no-referrer"
           />
           <div class="min-w-0">
-            <p class="font-medium leading-5">{{ session.outcome.target_product.title }}</p>
+            <p class="font-medium leading-5">{{ targetProduct.title }}</p>
             <p class="mt-1 font-mono text-xs text-muted-foreground">
-              {{ session.outcome.target_product.parent_asin }}
+              {{ targetProduct.parent_asin }}
             </p>
           </div>
         </div>
-        <p v-if="session.outcome.hit" class="font-medium text-emerald-700 dark:text-emerald-400">
+        <p v-if="session.outcome?.hit" class="font-medium text-emerald-700 dark:text-emerald-400">
           Hit at rank {{ session.outcome.best_rank }} on turn {{ session.outcome.first_hit_turn }}.
         </p>
-        <p v-else class="font-medium text-amber-700 dark:text-amber-400">No hit within ten turns.</p>
+        <p v-else-if="session.outcome" class="font-medium text-amber-700 dark:text-amber-400">No hit within ten turns.</p>
       </CardContent>
     </Card>
 

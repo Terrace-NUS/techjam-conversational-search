@@ -26,14 +26,15 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  start: [sampleId: string, dataset: string, replyModel: ReplyModel]
+  start: [sampleId: string, dataset: string, replyModel: ReplyModel, debug: boolean]
   datasetChange: [dataset: string]
 }>()
 
 const scenario = ref('all')
 const selectedId = ref('')
 const dataset = ref('')
-const replyModel = ref<ReplyModel>('template')
+const replyModel = ref<ReplyModel>('deepseek')
+const debug = ref(false)
 
 const scenarios = computed(() => [
   'all',
@@ -76,7 +77,7 @@ watch(
     <CardHeader class="space-y-3">
       <div class="flex items-center gap-2">
         <Badge variant="secondary">Human as Agent</Badge>
-        <Badge variant="outline">Template simulator</Badge>
+        <Badge variant="outline">{{ replyModel === 'deepseek' ? 'DeepSeek replies' : 'Template replies' }}</Badge>
       </div>
       <CardTitle class="text-2xl">Start a product-guessing session</CardTitle>
       <CardDescription class="max-w-xl leading-6">
@@ -147,14 +148,20 @@ watch(
       </div>
 
       <div class="rounded-lg border bg-muted/40 p-4 text-sm text-muted-foreground">
-        The target and simulator intent remain hidden until the session ends.
+        <label class="flex cursor-pointer items-start gap-3">
+          <input v-model="debug" type="checkbox" class="mt-0.5 size-4 accent-primary" />
+          <span>
+            <span class="font-medium text-foreground">Debug mode</span><br />
+            Show the target product and DeepSeek's canonical input during the session.
+          </span>
+        </label>
       </div>
 
       <Button
         class="w-full"
         size="lg"
         :disabled="loading || !selectedId || !dataset"
-        @click="emit('start', selectedId, dataset, replyModel)"
+        @click="emit('start', selectedId, dataset, replyModel, debug)"
       >
         <Play class="size-4" />
         {{ loading ? 'Starting…' : 'Start session' }}

@@ -34,11 +34,16 @@ export function createSession(
   sampleId: string,
   dataset: string,
   replyModel: ReplyModel,
+  debug: boolean,
 ): Promise<SimulatorSession> {
   return request('/api/sessions', {
     method: 'POST',
-    body: JSON.stringify({ sample_id: sampleId, dataset, reply_model: replyModel }),
+    body: JSON.stringify({ sample_id: sampleId, dataset, reply_model: replyModel, debug }),
   })
+}
+
+export function initializeSession(sessionId: string): Promise<SimulatorSession> {
+  return request(`/api/sessions/${encodeURIComponent(sessionId)}/initialize`, { method: 'POST' })
 }
 
 export function submitAgentTurn(

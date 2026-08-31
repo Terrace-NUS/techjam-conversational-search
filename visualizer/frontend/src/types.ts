@@ -78,6 +78,7 @@ export interface UserProfile {
 
 export interface TurnRecord {
   user_message: string
+  user_message_original: string | null
   agent_message: string
   ask_attribute: AskAttribute | null
   recommendations: ProductSummary[]
@@ -94,13 +95,17 @@ export interface SessionOutcome {
 
 export interface SimulatorSession {
   id: string
-  status: 'waiting_for_agent' | 'hit' | 'exhausted'
+  status: 'initializing' | 'waiting_for_agent' | 'hit' | 'exhausted' | 'error'
   dataset: string
   reply_model: ReplyModel
+  debug: boolean
+  initialization_error: string | null
+  debug_target_product: ProductSummary | null
   sample: SampleSummary
   user_profile: UserProfile
   current_turn: number
   current_user_message: string | null
+  current_user_message_original: string | null
   turns: TurnRecord[]
   outcome: SessionOutcome | null
 }

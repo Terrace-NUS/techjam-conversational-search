@@ -2,7 +2,7 @@
 import { nextTick, onMounted, ref, watch } from 'vue'
 import { CircleAlert, Moon, Palette, Sparkles, Sun } from '@lucide/vue'
 import { AnimatePresence, motion, MotionConfig, useAnimate } from 'motion-v'
-import { createSession, getDatasets, getSamples, submitAgentTurn } from './api'
+import { createSession, getDatasets, getSamples, initializeSession, submitAgentTurn } from './api'
 import AgentComposer from './components/AgentComposer.vue'
 import ConversationTimeline from './components/ConversationTimeline.vue'
 import SessionContext from './components/SessionContext.vue'
@@ -82,11 +82,24 @@ async function changeDataset(dataset: string) {
   }
 }
 
-async function start(sampleId: string, dataset: string, replyModel: ReplyModel) {
+async function start(
+  sampleId: string,
+  dataset: string,
+  replyModel: ReplyModel,
+  debug: boolean,
+) {
   loading.value = true
   error.value = ''
   try {
-    session.value = await createSession(sampleId, dataset, replyModel)
+    const created = await createSession(sampleId, dataset, replyModel, debug)
+    session.value = created
+    await nextTick()
+    const initialized = await initializeSession(created.id)
+    if (session.value?.id !== created.id) return
+    session.value = initialized
+    if (session.value?.status === 'error') {
+      throw new Error(session.value.initialization_error ?? 'Could not generate first reply')
+    }
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : 'Could not start session'
   } finally {
@@ -108,6 +121,7 @@ async function submit(input: AgentTurnInput, products: ProductSummary[]) {
         ...previousSession.turns,
         {
           user_message: previousSession.current_user_message ?? '',
+          user_message_original: previousSession.current_user_message_original,
           agent_message: input.message,
           ask_attribute: input.ask_attribute,
           recommendations: products,
@@ -236,6 +250,12 @@ function reset() {
             :loading="loading"
             @submit="submit"
           />
+          <div
+            v-else-if="session.status === 'initializing'"
+            class="rounded-xl border bg-card p-6 text-center text-sm text-muted-foreground"
+          >
+            Simulator is preparing the first reply…
+          </div>
           <div v-else class="rounded-xl border bg-card p-6 text-center text-sm text-muted-foreground">
             This session is complete. Review the target and conversation, or start a new case.
           </div>

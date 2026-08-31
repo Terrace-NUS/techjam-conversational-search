@@ -18,7 +18,7 @@ from evaluator.local_evaluator import (
     load_jsonl,
     normalize_recommendations,
 )
-from evaluator.reply_model import build_reply_model
+from evaluator.reply_model import ReplyModel, build_reply_model
 from evaluator.simulators import build_simulator
 
 
@@ -42,6 +42,7 @@ class CreateSessionRequest(BaseModel):
     sample_id: str = Field(min_length=1)
     dataset: str | None = Field(default=None, min_length=1)
     reply_model: Literal["template", "deepseek"] = "template"
+    debug: bool = False
 
 
 class AgentTurnRequest(BaseModel):
@@ -64,6 +65,24 @@ SUMMARY_FIELDS = (
 )
 DETAIL_FIELDS = ("features", "description", "details")
 SAMPLE_FIELDS = ("sample_id", "scenario_type", "difficulty_bucket", "category_bucket")
+
+
+class RecordingReplyModel(ReplyModel):
+    def __init__(self, reply_model: ReplyModel) -> None:
+        self.reply_model = reply_model
+        self.original: str | None = None
+
+    def rewrite_initial_message(self, canonical_message: str) -> str:
+        self.original = canonical_message
+        return self.reply_model.rewrite_initial_message(canonical_message)
+
+    def override_message(self, override: dict) -> str:
+        self.original = str(override.get("message", "Actually, please ignore my earlier preference."))
+        return self.reply_model.override_message(override)
+
+    def rewrite_query_answer(self, canonical_message: str) -> str:
+        self.original = canonical_message
+        return self.reply_model.rewrite_query_answer(canonical_message)
 
 
 class SimulatorService:
@@ -317,6 +336,7 @@ class SimulatorService:
         sample_id: str,
         dataset_id: str,
         reply_model_name: str,
+        debug: bool = False,
     ) -> dict:
         samples = self.datasets.get(dataset_id)
         if samples is None:
@@ -329,29 +349,54 @@ class SimulatorService:
         if target not in self.products:
             raise RuntimeError(f"target product {target!r} is missing from the catalog")
         session_id = uuid4().hex
+        reply_model = RecordingReplyModel(build_reply_model(reply_model_name))
         simulator = build_simulator(
             sample,
             self.categories,
             self.products,
-            build_reply_model(reply_model_name),
+            reply_model,
             session_id,
         )
         session = {
             "id": session_id,
-            "status": "waiting_for_agent",
+            "status": "initializing",
             "sample": sample,
             "dataset": dataset_id,
             "reply_model": reply_model_name,
+            "debug": debug,
+            "reply_model_recorder": reply_model,
             "simulator": simulator,
             "target": target,
             "current_turn": 1,
-            "current_user_message": simulator.initial_message(),
+            "current_user_message": None,
+            "current_user_message_original": None,
+            "initialization_error": None,
             "turns": [],
             "outcome": None,
         }
         with self.lock:
             self.sessions[session_id] = session
         return self.session_view(session)
+
+    def initialize_session(self, session_id: str) -> dict:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise HTTPException(status_code=404, detail="session not found")
+            if session["status"] != "initializing":
+                return self.session_view(session)
+        try:
+            message = session["simulator"].initial_message()
+        except Exception as error:
+            with self.lock:
+                session["status"] = "error"
+                session["initialization_error"] = str(error)
+                return self.session_view(session)
+        with self.lock:
+            session["current_user_message"] = message
+            session["current_user_message_original"] = session["reply_model_recorder"].original
+            session["status"] = "waiting_for_agent"
+            return self.session_view(session)
 
     def submit_turn(self, session_id: str, request: AgentTurnRequest) -> dict:
         with self.lock:
@@ -373,6 +418,7 @@ class SimulatorService:
             session["turns"].append(
                 {
                     "user_message": session["current_user_message"],
+                    "user_message_original": session["current_user_message_original"],
                     "agent_message": request.message,
                     "ask_attribute": request.ask_attribute,
                     "recommendations": ranked,
@@ -383,6 +429,7 @@ class SimulatorService:
             if hit_rank is not None or turn == MAX_TURNS:
                 session["status"] = "hit" if hit_rank is not None else "exhausted"
                 session["current_user_message"] = None
+                session["current_user_message_original"] = None
                 session["outcome"] = {
                     "hit": hit_rank is not None,
                     "first_hit_turn": turn if hit_rank is not None else None,
@@ -401,6 +448,7 @@ class SimulatorService:
             )
             session["current_turn"] = turn + 1
             session["current_user_message"] = next_message
+            session["current_user_message_original"] = session["reply_model_recorder"].original
             return self.session_view(session)
 
     def session_view(self, session: dict) -> dict:
@@ -416,12 +464,29 @@ class SimulatorService:
             "sample": self.sample_summary(session["sample"]),
             "dataset": session["dataset"],
             "reply_model": session["reply_model"],
+            "debug": session["debug"],
+            "initialization_error": session["initialization_error"],
+            "debug_target_product": (
+                self.product_summary(self.products[session["target"]])
+                if session["debug"]
+                else None
+            ),
             "user_profile": session["sample"]["user_profile"],
             "current_turn": session["current_turn"],
             "current_user_message": session["current_user_message"],
+            "current_user_message_original": (
+                session["current_user_message_original"]
+                if session["debug"] and session["reply_model"] == "deepseek"
+                else None
+            ),
             "turns": [
                 {
                     **turn,
+                    "user_message_original": (
+                        turn["user_message_original"]
+                        if session["debug"] and session["reply_model"] == "deepseek"
+                        else None
+                    ),
                     "recommendations": [
                         self.product_summary(self.products[parent_asin])
                         for parent_asin in turn["recommendations"]
@@ -435,7 +500,7 @@ class SimulatorService:
 
 def create_app(
     catalog_path: str | Path = "data/catalog.jsonl",
-    dataset_path: str | Path = "data/public_set.jsonl",
+    dataset_path: str | Path = "data/public_set_v2.jsonl",
     service: SimulatorService | None = None,
 ) -> FastAPI:
     @asynccontextmanager
@@ -504,9 +569,14 @@ def create_app(
                 request.sample_id,
                 request.dataset or simulator().default_dataset,
                 request.reply_model,
+                request.debug,
             )
         except (RuntimeError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/sessions/{session_id}/initialize")
+    def initialize_session(session_id: str) -> dict:
+        return simulator().initialize_session(session_id)
 
     @app.post("/api/sessions/{session_id}/turn")
     def submit_turn(session_id: str, request: AgentTurnRequest) -> dict:

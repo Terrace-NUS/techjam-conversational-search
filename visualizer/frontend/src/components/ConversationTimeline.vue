@@ -13,7 +13,8 @@ defineProps<{ session: SimulatorSession }>()
     <CardHeader class="border-b">
       <div class="flex items-center justify-between gap-3">
         <CardTitle class="text-base">Conversation</CardTitle>
-        <Badge v-if="session.status === 'waiting_for_agent'" variant="secondary">Your turn</Badge>
+        <Badge v-if="session.status === 'initializing'" variant="secondary">Simulator replying…</Badge>
+        <Badge v-else-if="session.status === 'waiting_for_agent'" variant="secondary">Your turn</Badge>
         <Badge v-else :variant="session.status === 'hit' ? 'default' : 'outline'">
           {{ session.status === 'hit' ? 'Target found' : 'Session complete' }}
         </Badge>
@@ -34,6 +35,9 @@ defineProps<{ session: SimulatorSession }>()
             <p class="mb-1 text-xs font-medium text-muted-foreground">Simulator · Turn {{ index + 1 }}</p>
             <p class="rounded-xl rounded-tl-sm bg-muted px-4 py-3 text-sm leading-6">
               {{ turn.user_message }}
+            </p>
+            <p v-if="turn.user_message_original" class="mt-1.5 text-xs leading-5 text-muted-foreground">
+              Original: {{ turn.user_message_original }}
             </p>
           </div>
         </motion.div>
@@ -100,6 +104,29 @@ defineProps<{ session: SimulatorSession }>()
           </p>
           <p class="rounded-xl rounded-tl-sm bg-primary px-4 py-3 text-sm leading-6 text-primary-foreground">
             {{ session.current_user_message }}
+          </p>
+          <p
+            v-if="session.current_user_message_original"
+            class="mt-1.5 text-xs leading-5 text-muted-foreground"
+          >
+            Original: {{ session.current_user_message_original }}
+          </p>
+        </div>
+      </motion.div>
+
+      <motion.div
+        v-if="session.status === 'initializing'"
+        class="flex gap-3"
+        :initial="{ opacity: 0, x: -14 }"
+        :animate="{ opacity: 1, x: 0 }"
+      >
+        <div class="grid size-8 shrink-0 place-items-center rounded-full bg-primary text-primary-foreground">
+          <UserRound class="size-4" />
+        </div>
+        <div>
+          <p class="mb-1 text-xs font-medium text-muted-foreground">Simulator · Turn 1</p>
+          <p class="rounded-xl rounded-tl-sm bg-muted px-4 py-3 text-sm text-muted-foreground">
+            Generating reply…
           </p>
         </div>
       </motion.div>

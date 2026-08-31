@@ -55,7 +55,12 @@ class VisualizerApiTest(unittest.TestCase):
                 response = client.post("/api/sessions", json={"sample_id": "override-1"})
                 self.assertEqual(response.status_code, 201)
                 view = response.json()
+                self.assertEqual(view["status"], "initializing")
                 self.assertNotIn("TARGET", json.dumps(view))
+                self.assertEqual(
+                    client.post(f"/api/sessions/{view['id']}/initialize").json()["status"],
+                    "waiting_for_agent",
+                )
 
                 response = client.post(
                     f"/api/sessions/{view['id']}/turn",
@@ -91,6 +96,12 @@ class VisualizerApiTest(unittest.TestCase):
                     404,
                 )
 
+                debug_view = client.post(
+                    "/api/sessions",
+                    json={"sample_id": "override-1", "dataset": "samples", "debug": True},
+                ).json()
+                self.assertEqual(debug_view["debug_target_product"]["parent_asin"], "TARGET")
+
     def test_boundary_reply_and_turn_limit_match_evaluator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -120,6 +131,7 @@ class VisualizerApiTest(unittest.TestCase):
             with TestClient(create_app(service=SimulatorService(catalog, dataset))) as client:
                 view = client.post("/api/sessions", json={"sample_id": "boundary-1"}).json()
                 session_id = view["id"]
+                client.post(f"/api/sessions/{session_id}/initialize")
                 response = client.post(
                     f"/api/sessions/{session_id}/turn",
                     json={
