@@ -38,6 +38,7 @@ import type {
   SessionStartOptions,
   SimulatorSession,
 } from './types'
+import { ATTRIBUTE_QUESTIONS } from './types'
 
 type ThemePalette = 'default' | 'claude'
 const SIMULATOR_REPLY_DELAY_MS = 2000
@@ -103,14 +104,15 @@ async function start(options: SessionStartOptions) {
   error.value = ''
   try {
     const created = options.mode === 'human_as_agent'
-      ? await createSession(options.sampleId, options.dataset, options.replyModel, options.debug)
+      ? await createSession(options.sampleId, options.dataset, options.replyModel, options.embeddingProvider, options.debug)
       : options.mode === 'human_as_simulator'
-        ? await createHumanSession(options.sampleId, options.dataset, options.agent)
+        ? await createHumanSession(options.sampleId, options.dataset, options.agent, options.embeddingProvider)
         : await createAutoSession(
             options.sampleId,
             options.dataset,
             options.agent,
             options.replyModel,
+            options.embeddingProvider,
             options.debug,
           )
     session.value = created
@@ -197,10 +199,15 @@ async function submit(input: AgentTurnInput, products: ProductSummary[]) {
         {
           user_message: previousSession.current_user_message ?? '',
           user_message_original: previousSession.current_user_message_original,
-          agent_message: input.message,
+          agent_message: input.message || (input.ask_attribute ? ATTRIBUTE_QUESTIONS[input.ask_attribute] : ''),
           ask_attribute: input.ask_attribute,
           recommendations: products,
           hit_rank: null,
+          subscore: null,
+          intent_before: previousSession.metrics.current_intent,
+          intent_after: previousSession.metrics.current_intent,
+          intent_changed: false,
+          recommendation_scores: {},
         },
       ],
     }

@@ -18,9 +18,15 @@ from evaluator.reply_model import (
     build_reply_model,
 )
 from evaluator.simulators import Simulator, V1Simulator, V2Simulator
+from evaluator.simulators.v2 import query_attribute_from_response
 from starter.agent import Agent, build_agent
 from starter.baseline import BaselineAgent
 from starter.v1 import V1Agent
+from starter.terrace import TerraceAgent
+from scripts.structured_text import structured_product_text
+from scripts import query_attribute as query_attribute_module
+from scripts.query_handler import QueryHandler
+from scripts.schema import Item
 
 
 class EchoTargetAgent:
@@ -51,7 +57,122 @@ class ModificationAgent:
         }
 
 
+class IntentEscalationAgent:
+    """Miss once, then hit; captures the query-handler reply between turns."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def reset(self, session_id: str, user_profile: dict) -> None:
+        pass
+
+    def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
+        self.messages.append(user_message)
+        asin = "B" if turn == 1 else "A"
+        return {
+            "message": "ok",
+            "ask_attribute": "style",
+            "recommendations": [{"parent_asin": asin}],
+        }
+
+
+class FixedRewardCalculator:
+    """Offline reward double: forces escalation without Gemini/network access."""
+
+    def __init__(self, subscore: float) -> None:
+        self.subscore = subscore
+        self.calls: list[tuple[list[str], str]] = []
+
+    def score_turn(self, ranked: list[str], target_asin: str, products: dict[str, dict]) -> float:
+        self.calls.append((ranked, target_asin))
+        return self.subscore
+
+
+class FakeAttributeExtractor:
+    def __init__(self, mapping: dict[str, str | None]) -> None:
+        self.mapping = mapping
+
+    def extract(self, query: str, candidates: tuple[str, ...]) -> str | None:
+        return self.mapping.get(query)
+
+
 class EvaluatorTest(unittest.TestCase):
+    def test_natural_language_attribute_precedes_structured_fallback(self) -> None:
+        item = Item(
+            "A",
+            {},
+            {"browsing": {"material": "material clue", "color": "color clue"}},
+        )
+        handler = QueryHandler("natural-query", item)
+        query_attribute_module.set_default_extractor(
+            FakeAttributeExtractor({"What fabric do you prefer?": "material"})
+        )
+        self.addCleanup(query_attribute_module.set_default_extractor, None)
+
+        attribute = query_attribute_from_response(
+            {"message": "What fabric do you prefer?", "ask_attribute": "color"},
+            handler,
+        )
+
+        self.assertEqual(attribute, "material")
+
+    def test_structured_attribute_is_used_when_message_has_no_match(self) -> None:
+        item = Item("A", {}, {"browsing": {"material": "material clue"}})
+        handler = QueryHandler("fallback-query", item)
+        query_attribute_module.set_default_extractor(FakeAttributeExtractor({}))
+        self.addCleanup(query_attribute_module.set_default_extractor, None)
+
+        attribute = query_attribute_from_response(
+            {"message": "Thanks.", "ask_attribute": "material"}, handler
+        )
+
+        self.assertEqual(attribute, "material")
+
+    def test_natural_language_attribute_missing_from_item_returns_none(self) -> None:
+        item = Item("A", {}, {"browsing": {"feature": "rear pocket"}})
+        handler = QueryHandler("missing-color", item)
+        query_attribute_module.set_default_extractor(
+            FakeAttributeExtractor({"What's the color?": "color"})
+        )
+        self.addCleanup(query_attribute_module.set_default_extractor, None)
+
+        attribute = query_attribute_from_response(
+            {"message": "What's the color?", "ask_attribute": "feature"}, handler
+        )
+
+        self.assertIsNone(attribute)
+
+    def test_structured_product_text_filters_noise(self) -> None:
+        text = structured_product_text({
+            "title": "Premium Cotton Shirt",
+            "store": "Acme",
+            "categories": ["Clothing", "Shirts", "Shirts"],
+            "features": ["100% Cotton", "Machine Wash", "100% Cotton"],
+            "details": {
+                "Material": "Cotton",
+                "Color": "Blue",
+                "Item model number": "XYZ-1",
+            },
+            "description": ["Best Seller! " + ("Long marketing copy. " * 100)],
+            "price": 24.5,
+        })
+        self.assertIn("TITLE: premium cotton shirt", text)
+        self.assertIn("BRAND: acme", text)
+        self.assertIn("CATEGORY: clothing | shirts", text)
+        self.assertIn("ATTRIBUTES: material: cotton | color: blue", text)
+        self.assertNotIn("item model number", text)
+        self.assertNotIn("best seller", text)
+
+    def test_structured_product_text_omits_empty_and_duplicate_values(self) -> None:
+        text = structured_product_text({
+            "title": "  Shirt  ",
+            "categories": ["Shirts", "shirts", ""],
+            "features": [],
+            "details": {},
+            "description": [],
+        })
+        self.assertEqual(text, "TITLE: shirt\nCATEGORY: shirts")
+
     def test_versioned_simulators_implement_abc(self) -> None:
         self.assertTrue(issubclass(V1Simulator, Simulator))
         self.assertTrue(issubclass(V2Simulator, Simulator))
@@ -63,6 +184,7 @@ class EvaluatorTest(unittest.TestCase):
     def test_agent_factory_uses_abc_implementations(self) -> None:
         self.assertTrue(issubclass(BaselineAgent, Agent))
         self.assertTrue(issubclass(V1Agent, Agent))
+        self.assertTrue(issubclass(TerraceAgent, Agent))
         with tempfile.TemporaryDirectory() as directory:
             catalog = Path(directory) / "catalog.jsonl"
             catalog.write_text(json.dumps({"parent_asin": "A"}) + "\n", encoding="utf-8")
@@ -194,6 +316,55 @@ class EvaluatorTest(unittest.TestCase):
             path.write_text(json.dumps(sample) + "\n", encoding="utf-8")
             self.assertEqual(load_jsonl(path), [sample])
 
+    def test_subscore_escalates_custom_session_and_query_handler_uses_buying_intent(self) -> None:
+        products = {
+            "A": {"parent_asin": "A", "title": "target shirt"},
+            "B": {"parent_asin": "B", "title": "other shirt"},
+        }
+        sample = {
+            "version": "v2",
+            "sample_id": "intent_escalation_1",
+            "intent": "browsing",
+            "override": False,
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+            "item_id": "A",
+            "features": products["A"],
+            "intent_descriptions": {
+                    "browsing": {
+                        "style": "browsing style",
+                        "material": "browsing material",
+                        "color": "browsing color",
+                        "size": "browsing size",
+                    },
+                    "buying": {
+                        "style": "buying style",
+                        "material": "buying material",
+                        "color": "buying color",
+                        "size": "buying size",
+                    },
+                },
+            "fake_attributes": {},
+            "correction_messages": {},
+            "modify_turn": None,
+        }
+        agent = IntentEscalationAgent()
+        reward_calculator = FixedRewardCalculator(0.8)
+        result = evaluate(
+            agent,
+            [sample],
+            {"A", "B"},
+            {"A": ["Clothing", "Shirts"]},
+            products,
+            reward_calculator=reward_calculator,
+            intent_threshold=0.5,
+        )
+
+        self.assertEqual(reward_calculator.calls, [(["B"], "A")])
+        self.assertEqual(result["sessions"][0]["final_intent"], "buying")
+        self.assertIn("buying style", agent.messages)
+        self.assertEqual(result["sessions"][0]["first_hit_turn"], 2)
+
     def test_custom_override_uses_fake_then_correction_at_modify_turn(self) -> None:
         catalog_ids = {"A"}
         categories = {"A": ["Clothing", "Shirts"]}
@@ -215,12 +386,49 @@ class EvaluatorTest(unittest.TestCase):
             "correction_messages": {"style": {"browsing": "Correction: true style", "buying": "Correction: true style"}},
             "modify_turn": 3,
         }
+        simulator = V2Simulator(
+            sample,
+            categories,
+            products,
+            TemplateReplyModel(),
+            "pre-modification-hit",
+        )
+        self.assertTrue(simulator.ready_for_hit)
         agent = ModificationAgent()
         result = evaluate(agent, [sample], catalog_ids, categories, products)
         self.assertEqual(result["hit_rate_at_10"], 1.0)
         self.assertEqual(result["sessions"][0]["version"], "v2")
         self.assertIn("fake style", agent.messages)
         self.assertTrue(any("Correction: true style" in message for message in agent.messages))
+
+    def test_custom_override_silently_expires_before_first_fakeable_question(self) -> None:
+        product = {"parent_asin": "A"}
+        sample = {
+            "version": "v2",
+            "sample_id": "override_expired",
+            "intent": "buying",
+            "override": True,
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+            "item_id": "A",
+            "features": product,
+            "intent_descriptions": {
+                "buying": {"style": "true style", "feature": "true feature"},
+            },
+            "fake_attributes": {"style": {"buying": "fake style"}},
+            "correction_messages": {"style": {"buying": "Correction: true style"}},
+            "modify_turn": 3,
+        }
+        simulator = V2Simulator(
+            sample,
+            {"A": ["Clothing", "Shirts"]},
+            {"A": product},
+            TemplateReplyModel(),
+            "expired-override",
+        )
+
+        self.assertEqual(simulator.next_message({"ask_attribute": "feature"}, 1), "true feature")
+        self.assertEqual(simulator.next_message({"ask_attribute": "style"}, 3), "true style")
 
     def test_v2_without_modification_uses_embedded_item(self) -> None:
         product = {"parent_asin": "A"}
@@ -285,6 +493,41 @@ class EvaluatorTest(unittest.TestCase):
         self.assertEqual(
             simulator.initial_message(),
             "I'm looking for fitted shirts.",
+        )
+
+    def test_v2_discovery_initial_message_uses_open_category_goal(self) -> None:
+        product = {"parent_asin": "A"}
+        sample = {
+            "version": "v2",
+            "sample_id": "discover_1",
+            "intent": "discovery",
+            "override": False,
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+            "item_id": "A",
+            "features": product,
+            "intent_descriptions": {
+                "discovery": {
+                    "brand": ["maker undecided"],
+                    "category": ["everyday styling", "finishing touch"],
+                },
+                "browsing": {"category": "I'm browsing accessories."},
+                "buying": {"category": "I want a necklace."},
+            },
+            "fake_attributes": {},
+            "correction_messages": {},
+            "modify_turn": None,
+        }
+        simulator = V2Simulator(
+            sample,
+            {"A": ["Clothing", "Accessories"]},
+            {"A": product},
+            TemplateReplyModel(),
+            "discovery-session",
+        )
+        self.assertEqual(
+            simulator.initial_message(),
+            "everyday styling; finishing touch",
         )
 
     def test_mixed_dataset_switches_logic_per_record(self) -> None:

@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from evaluator.local_evaluator import (
+    DEFAULT_INTENT_THRESHOLD,
     MAX_TURNS,
     TOP_K,
     catalog_index,
@@ -21,6 +22,13 @@ from evaluator.local_evaluator import (
 from evaluator.reply_model import ReplyModel, build_reply_model
 from evaluator.simulators import build_simulator
 from starter.agent import Agent, build_agent
+from scripts.intent_manager import IntentManager, VALID_INTENTS
+from scripts.reward_calculator import (
+    GeminiEmbeddingClient,
+    RewardCalculator,
+    SiliconFlowEmbeddingClient,
+)
+from scripts.structured_text import structured_product_text
 
 
 AskAttribute = Literal[
@@ -35,6 +43,7 @@ AskAttribute = Literal[
     "use_case",
     "other",
 ]
+EmbeddingProvider = Literal["gemini", "siliconflow"]
 
 
 class CreateSessionRequest(BaseModel):
@@ -43,6 +52,7 @@ class CreateSessionRequest(BaseModel):
     sample_id: str = Field(min_length=1)
     dataset: str | None = Field(default=None, min_length=1)
     reply_model: Literal["template", "deepseek"] = "template"
+    embedding_provider: EmbeddingProvider = "gemini"
     debug: bool = False
 
 
@@ -60,6 +70,7 @@ class CreateHumanSessionRequest(BaseModel):
     sample_id: str = Field(min_length=1)
     dataset: str | None = Field(default=None, min_length=1)
     agent: Literal["baseline", "v1"] = "v1"
+    embedding_provider: EmbeddingProvider = "gemini"
 
 
 class CreateAutoSessionRequest(BaseModel):
@@ -69,6 +80,7 @@ class CreateAutoSessionRequest(BaseModel):
     dataset: str | None = Field(default=None, min_length=1)
     agent: Literal["baseline", "v1"] = "v1"
     reply_model: Literal["template", "deepseek"] = "deepseek"
+    embedding_provider: EmbeddingProvider = "gemini"
     debug: bool = False
 
 
@@ -202,8 +214,70 @@ class SimulatorService:
         }
         self.sessions: dict[str, dict] = {}
         self.agents: dict[str, Agent] = {}
+        self.reward_calculators: dict[str, RewardCalculator] = {}
         # ponytail: one lock is enough for a local visualizer; split per session if contention appears.
         self.lock = Lock()
+
+    @staticmethod
+    def initial_intent(sample: dict) -> str:
+        intent = sample.get("intent")
+        if intent in VALID_INTENTS:
+            return intent
+        return "buying" if sample.get("scenario_type") == "buying" else "browsing"
+
+    def turn_metrics(self, session: dict, ranked: list[str], update_intent: bool) -> dict:
+        before = session["intent_manager"].intent
+        score_error = None
+        scores: dict[str, float | None] = {}
+        for parent_asin in ranked:
+            if parent_asin == session["target"]:
+                scores[parent_asin] = 1.0
+                continue
+            try:
+                provider = session["embedding_provider"]
+                if provider not in self.reward_calculators:
+                    embedding_client = (
+                        SiliconFlowEmbeddingClient()
+                        if provider == "siliconflow"
+                        else GeminiEmbeddingClient()
+                    )
+                    self.reward_calculators[provider] = RewardCalculator(
+                        embedding_client,
+                        text_fn=structured_product_text,
+                    )
+                scores[parent_asin] = self.reward_calculators[provider].score_turn(
+                    [parent_asin],
+                    session["target"],
+                    self.products,
+                )
+            except Exception as error:
+                scores[parent_asin] = None
+                score_error = str(error)
+        valid_scores = [value for value in scores.values() if value is not None]
+        score = max(valid_scores) if valid_scores else (0.0 if not ranked else None)
+        changed = score is not None and update_intent and session["intent_manager"].update(score)
+        if changed:
+            query_handler = getattr(session.get("simulator"), "query_handler", None)
+            if query_handler is not None:
+                query_handler.set_intent(session["intent_manager"].intent)
+        session["score_error"] = score_error
+        return {
+            "subscore": score,
+            "intent_before": before,
+            "intent_after": session["intent_manager"].intent,
+            "intent_changed": changed,
+            "recommendation_scores": scores if session["debug"] else {},
+        }
+
+    @staticmethod
+    def metrics_view(session: dict) -> dict:
+        turns = session["turns"]
+        return {
+            "current_intent": session["intent_manager"].intent,
+            "threshold": session["intent_manager"].current_threshold,
+            "last_subscore": turns[-1]["subscore"] if turns else None,
+            "score_error": session["score_error"],
+        }
 
     @staticmethod
     def sample_summary(sample: dict) -> dict:
@@ -379,6 +453,7 @@ class SimulatorService:
         sample_id: str,
         dataset_id: str,
         reply_model_name: str,
+        embedding_provider: str,
         debug: bool = False,
     ) -> dict:
         samples = self.datasets.get(dataset_id)
@@ -407,10 +482,16 @@ class SimulatorService:
             "sample": sample,
             "dataset": dataset_id,
             "reply_model": reply_model_name,
+            "embedding_provider": embedding_provider,
             "debug": debug,
             "reply_model_recorder": reply_model,
             "simulator": simulator,
             "target": target,
+            "intent_manager": IntentManager(
+                self.initial_intent(sample),
+                threshold=DEFAULT_INTENT_THRESHOLD,
+            ),
+            "score_error": None,
             "current_turn": 1,
             "current_user_message": None,
             "current_user_message_original": None,
@@ -448,9 +529,12 @@ class SimulatorService:
         dataset_id: str,
         agent_name: str,
         reply_model_name: str,
+        embedding_provider: str,
         debug: bool = False,
     ) -> dict:
-        view = self.create_session(sample_id, dataset_id, reply_model_name, debug)
+        view = self.create_session(
+            sample_id, dataset_id, reply_model_name, embedding_provider, debug
+        )
         with self.lock:
             session = self.sessions[view["id"]]
             session["mode"] = "agent_simulator"
@@ -510,6 +594,7 @@ class SimulatorService:
         sample_id: str,
         dataset_id: str,
         agent_name: str,
+        embedding_provider: str,
     ) -> dict:
         samples = self.datasets.get(dataset_id)
         if samples is None:
@@ -528,8 +613,15 @@ class SimulatorService:
             "sample": sample,
             "dataset": dataset_id,
             "agent_name": agent_name,
+            "embedding_provider": embedding_provider,
             "agent": None,
+            "debug": True,
             "target": target,
+            "intent_manager": IntentManager(
+                self.initial_intent(sample),
+                threshold=DEFAULT_INTENT_THRESHOLD,
+            ),
+            "score_error": None,
             "current_turn": 1,
             "turns": [],
             "outcome": None,
@@ -587,6 +679,12 @@ class SimulatorService:
             turn = session["current_turn"]
             target = session["target"]
             rank = recommendations.index(target) + 1 if target in recommendations else None
+            metrics = self.turn_metrics(
+                session,
+                recommendations,
+                update_intent=rank is None and turn < MAX_TURNS,
+            )
+            session["turns"][-1].update(metrics)
             if rank is not None or turn == MAX_TURNS:
                 session["turns"][-1]["hit_rank"] = rank
                 session["status"] = "hit" if rank is not None else "exhausted"
@@ -618,18 +716,36 @@ class SimulatorService:
                 else None
             )
             turn = session["current_turn"]
+            metrics = self.turn_metrics(
+                session,
+                ranked,
+                update_intent=hit_rank is None and turn < MAX_TURNS,
+            )
+            simulator_response = {
+                "message": request.message,
+                "ask_attribute": request.ask_attribute,
+                "recommendations": request.recommendations,
+            }
+            terminal = hit_rank is not None or turn == MAX_TURNS
+            queried_attribute = (
+                simulator.query_attribute(simulator_response)
+                if session["debug"] or not terminal
+                else None
+            )
             session["turns"].append(
                 {
                     "user_message": session["current_user_message"],
                     "user_message_original": session["current_user_message_original"],
                     "agent_message": request.message,
                     "ask_attribute": request.ask_attribute,
+                    "queried_attribute": queried_attribute,
                     "recommendations": ranked,
                     "hit_rank": hit_rank,
+                    **metrics,
                 }
             )
 
-            if hit_rank is not None or turn == MAX_TURNS:
+            if terminal:
                 session["status"] = "hit" if hit_rank is not None else "exhausted"
                 session["current_user_message"] = None
                 session["current_user_message_original"] = None
@@ -642,11 +758,7 @@ class SimulatorService:
                 return self.session_view(session)
 
             next_message = simulator.next_message(
-                {
-                    "message": request.message,
-                    "ask_attribute": request.ask_attribute,
-                    "recommendations": request.recommendations,
-                },
+                {**simulator_response, "message": "", "ask_attribute": queried_attribute},
                 turn + 1,
             )
             session["current_turn"] = turn + 1
@@ -670,6 +782,7 @@ class SimulatorService:
             "sample": self.sample_summary(session["sample"]),
             "dataset": session["dataset"],
             "reply_model": session["reply_model"],
+            "embedding_provider": session["embedding_provider"],
             "agent": session.get("agent_name"),
             "debug": session["debug"],
             "initialization_error": session["initialization_error"],
@@ -686,9 +799,13 @@ class SimulatorService:
                 if session["debug"] and session["reply_model"] == "deepseek"
                 else None
             ),
+            "metrics": self.metrics_view(session),
             "turns": [
                 {
                     **turn,
+                    "queried_attribute": (
+                        turn["queried_attribute"] if session["debug"] else None
+                    ),
                     "user_message_original": (
                         turn["user_message_original"]
                         if session["debug"] and session["reply_model"] == "deepseek"
@@ -722,8 +839,9 @@ class SimulatorService:
             "sample": self.sample_summary(sample),
             "dataset": session["dataset"],
             "reply_model": None,
+            "embedding_provider": session["embedding_provider"],
             "agent": session["agent_name"],
-            "debug": True,
+            "debug": session["debug"],
             "initialization_error": session["initialization_error"],
             "debug_target_product": self.product_detail(self.products[session["target"]]),
             "human_context": {
@@ -738,6 +856,7 @@ class SimulatorService:
             "current_turn": session["current_turn"],
             "current_user_message": None,
             "current_user_message_original": None,
+            "metrics": self.metrics_view(session),
             "turns": [
                 {
                     **turn,
@@ -827,6 +946,7 @@ def create_app(
                 request.sample_id,
                 request.dataset or simulator().default_dataset,
                 request.reply_model,
+                request.embedding_provider,
                 request.debug,
             )
         except (RuntimeError, ValueError) as error:
@@ -844,6 +964,7 @@ def create_app(
                 request.dataset or simulator().default_dataset,
                 request.agent,
                 request.reply_model,
+                request.embedding_provider,
                 request.debug,
             )
         except (RuntimeError, ValueError) as error:
@@ -863,6 +984,7 @@ def create_app(
             request.sample_id,
             request.dataset or simulator().default_dataset,
             request.agent,
+            request.embedding_provider,
         )
 
     @app.post("/api/human-sessions/{session_id}/initialize")

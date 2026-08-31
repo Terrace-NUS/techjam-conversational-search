@@ -4,7 +4,7 @@ import { motion } from 'motion-v'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import ProductDetailDialog from './ProductDetailDialog.vue'
-import type { SimulatorSession } from '@/types'
+import { ATTRIBUTE_QUESTIONS, type SimulatorSession } from '@/types'
 
 defineProps<{ session: SimulatorSession }>()
 </script>
@@ -67,13 +67,21 @@ defineProps<{ session: SimulatorSession }>()
               <Badge v-if="turn.hit_rank" class="bg-emerald-600">
                 <CheckCircle2 class="size-3" /> rank {{ turn.hit_rank }}
               </Badge>
+              <Badge v-if="session.debug && turn.subscore !== null" variant="outline">
+                score {{ turn.subscore.toFixed(3) }}
+              </Badge>
+              <Badge v-if="session.debug && turn.intent_changed" class="bg-violet-600">
+                {{ turn.intent_before }} → {{ turn.intent_after }}
+              </Badge>
             </div>
             <div
               v-if="turn.agent_message.trim() || turn.ask_attribute"
               :class="['max-w-[90%] space-y-2 rounded-xl border bg-card px-4 py-3 text-left text-sm leading-6', session.mode === 'human_as_simulator' ? 'rounded-tl-sm' : 'rounded-tr-sm']"
             >
-              <p v-if="turn.agent_message.trim()">{{ turn.agent_message }}</p>
-              <Badge v-if="turn.ask_attribute" variant="outline">ask: {{ turn.ask_attribute }}</Badge>
+              <p>{{ turn.agent_message.trim() || (turn.ask_attribute && ATTRIBUTE_QUESTIONS[turn.ask_attribute]) }}</p>
+              <p v-if="session.debug && session.mode !== 'human_as_simulator'" class="font-mono text-xs text-muted-foreground">
+                queried attribute: {{ turn.queried_attribute === undefined ? 'resolving…' : (turn.queried_attribute ?? 'null') }}
+              </p>
             </div>
             <div :class="['flex flex-wrap gap-1.5', session.mode !== 'human_as_simulator' && 'justify-end']" v-if="turn.recommendations.length">
               <ProductDetailDialog
@@ -97,6 +105,11 @@ defineProps<{ session: SimulatorSession }>()
                     referrerpolicy="no-referrer"
                   />
                   #{{ productIndex + 1 }} {{ product.parent_asin }}
+                  <span v-if="session.debug" class="font-mono opacity-70">
+                    · {{ turn.recommendation_scores[product.parent_asin] === null || turn.recommendation_scores[product.parent_asin] === undefined
+                      ? 'score —'
+                      : `score ${turn.recommendation_scores[product.parent_asin]?.toFixed(3)}` }}
+                  </span>
                 </Badge>
               </ProductDetailDialog>
             </div>

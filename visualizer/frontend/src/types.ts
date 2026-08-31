@@ -13,6 +13,19 @@ export const ASK_ATTRIBUTES = [
 
 export type AskAttribute = (typeof ASK_ATTRIBUTES)[number]
 
+export const ATTRIBUTE_QUESTIONS: Record<AskAttribute, string> = {
+  category: 'What kind of product are you looking for?',
+  material: 'Do you have a material preference?',
+  color: 'Do you have a color preference?',
+  size: 'Are there any sizing or fit requirements?',
+  style: 'What style or fit do you prefer?',
+  brand: 'Do you have a preferred brand?',
+  budget: 'What budget range should I use?',
+  feature: 'Which product features matter most to you?',
+  use_case: 'What will you mainly use it for?',
+  other: 'What other details matter most to you?',
+}
+
 export interface SampleSummary {
   sample_id: string
   scenario_type: string
@@ -28,7 +41,9 @@ export interface DatasetOption {
 }
 
 export type ReplyModel = 'template' | 'deepseek'
+export type EmbeddingProvider = 'gemini' | 'siliconflow'
 export type AgentName = 'baseline' | 'v1'
+export type Intent = 'discovery' | 'browsing' | 'buying'
 export type SessionMode = 'human_as_agent' | 'human_as_simulator' | 'agent_simulator'
 
 export interface SessionStartOptions {
@@ -36,6 +51,7 @@ export interface SessionStartOptions {
   sampleId: string
   dataset: string
   replyModel: ReplyModel
+  embeddingProvider: EmbeddingProvider
   agent: AgentName
   debug: boolean
 }
@@ -92,8 +108,21 @@ export interface TurnRecord {
   user_message_original: string | null
   agent_message: string
   ask_attribute: AskAttribute | null
+  queried_attribute?: AskAttribute | null
   recommendations: ProductSummary[]
   hit_rank: number | null
+  subscore: number | null
+  intent_before: Intent
+  intent_after: Intent
+  intent_changed: boolean
+  recommendation_scores: Record<string, number | null>
+}
+
+export interface SessionMetrics {
+  current_intent: Intent
+  threshold: number
+  last_subscore: number | null
+  score_error: string | null
 }
 
 export interface SessionOutcome {
@@ -116,6 +145,7 @@ export interface SimulatorSession {
     | 'error'
   dataset: string
   reply_model: ReplyModel | null
+  embedding_provider: EmbeddingProvider
   agent?: AgentName
   debug: boolean
   initialization_error: string | null
@@ -125,10 +155,11 @@ export interface SimulatorSession {
   current_turn: number
   current_user_message: string | null
   current_user_message_original: string | null
+  metrics: SessionMetrics
   human_context?: {
     intent: string
     override: boolean
-    intent_description: Record<string, string> | null
+    intent_description: Record<string, string | string[]> | null
     fake_attributes: Record<string, unknown>
     correction_messages: Record<string, unknown>
     modify_turn: number | null

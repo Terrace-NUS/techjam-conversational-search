@@ -24,6 +24,7 @@ def _load_jsonl(path: Path) -> list[dict]:
 def _label_v2_samples(samples: list[dict]) -> list[tuple[dict, str, bool]]:
     """Resolve legacy scenarios once so v2 records carry explicit intent state."""
     override_index = 0
+    buying_index = 0
     labeled: list[tuple[dict, str, bool]] = []
     for sample in samples:
         scenario = sample.get("scenario_type")
@@ -35,6 +36,9 @@ def _label_v2_samples(samples: list[dict]) -> list[tuple[dict, str, bool]]:
             intent, override = "buying", False
         else:
             intent, override = "browsing", False
+        if intent == "buying":
+            intent = "buying" if buying_index < 50 else "discovery"
+            buying_index += 1
         labeled.append((sample, intent, override))
     return labeled
 
@@ -130,7 +134,9 @@ def build_dataset(
                 logger.warning("skipping %s: not found in catalog", item_id)
                 continue
 
-            attributes, rejected = llm_extract_attributes(product, writer, attribute_cache_dir)
+            attributes, rejected = llm_extract_attributes(
+                product, writer, attribute_cache_dir
+            )
             for note in rejected:
                 logger.info("%s dropped unverified %s", item_id, note)
             extracted_claims = json.loads(
@@ -153,11 +159,18 @@ def build_dataset(
 
             item = build_item(product, attributes, writer, intent_cache_dir)
             modification = build_modification(
-                product, item.item_id, attributes, writer, fake_cache_dir
+                product,
+                item.item_id,
+                attributes,
+                item.intent_descriptions,
+                writer,
+                fake_cache_dir,
             )
             if modification is None:
                 if override:
-                    raise ValueError(f"override sample {sample['sample_id']} has no fakeable attributes")
+                    raise ValueError(
+                        f"override sample {sample['sample_id']} has no fakeable attributes"
+                    )
                 logger.info("%s has no fakeable attributes", item_id)
             dataset_file.write(
                 json.dumps(

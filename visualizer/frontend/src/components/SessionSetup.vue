@@ -20,6 +20,7 @@ import {
 import type {
   AgentName,
   DatasetOption,
+  EmbeddingProvider,
   ReplyModel,
   SampleSummary,
   SessionMode,
@@ -42,6 +43,7 @@ const selectedId = ref('')
 const dataset = ref('')
 const mode = ref<SessionMode>('human_as_agent')
 const replyModel = ref<ReplyModel>('deepseek')
+const embeddingProvider = ref<EmbeddingProvider>('gemini')
 const agent = ref<AgentName>('v1')
 const debug = ref(false)
 
@@ -158,6 +160,19 @@ watch(
         </div>
 
         <div class="grid gap-2 text-sm font-medium">
+          <label for="embedding-provider-select">Embedding</label>
+          <Select v-model="embeddingProvider">
+            <SelectTrigger id="embedding-provider-select" class="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="gemini">Gemini</SelectItem>
+              <SelectItem value="siliconflow">SiliconFlow</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div class="grid gap-2 text-sm font-medium">
           <label for="scenario-select">Scenario</label>
           <Select v-model="scenario">
             <SelectTrigger id="scenario-select" class="w-full">
@@ -207,7 +222,7 @@ watch(
         class="w-full"
         size="lg"
         :disabled="loading || !selectedId || !dataset"
-        @click="emit('start', { mode, sampleId: selectedId, dataset, replyModel, agent, debug })"
+        @click="emit('start', { mode, sampleId: selectedId, dataset, replyModel, embeddingProvider, agent, debug })"
       >
         <Play class="size-4" />
         {{ loading ? 'Starting…' : 'Start session' }}

@@ -21,6 +21,9 @@ tests/test_organizer_pipeline.py
 *.log
 node_modules/
 dist/
+artifacts/
 data/thumbs/
 data/custom/
+data/cache
+data/attribute_json
 data/custom_retry_B08ZKFD4GM

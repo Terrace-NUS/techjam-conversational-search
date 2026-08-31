@@ -4,11 +4,13 @@ import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
 from pathlib import Path
 import statistics
 import sys
 import threading
 import uuid
+from typing import TYPE_CHECKING
 
 from evaluator.reply_model import (
     ReplyModel,
@@ -17,10 +19,16 @@ from evaluator.reply_model import (
 )
 from evaluator.simulators import build_simulator
 from starter.agent import Agent, build_agent
+from scripts.intent_manager import IntentManager, VALID_INTENTS
+from scripts.structured_text import structured_product_text
+
+if TYPE_CHECKING:
+    from scripts.reward_calculator import RewardCalculator
 
 
 MAX_TURNS = 10
 TOP_K = 10
+DEFAULT_INTENT_THRESHOLD = None
 
 
 def load_jsonl(path: str | Path) -> list[dict]:
@@ -141,9 +149,15 @@ def _evaluate_sample(
     products: dict[str, dict],
     reply_model: ReplyModel,
     agent_lock: threading.Lock,
+    reward_calculator: "RewardCalculator | None" = None,
+    intent_threshold: float | None = DEFAULT_INTENT_THRESHOLD,
 ) -> tuple[dict, int, int]:
     session_id = f"public_{uuid.uuid4().hex}"
     simulator = build_simulator(sample, categories, products, reply_model, session_id)
+    initial_intent = sample.get("intent")
+    if initial_intent not in VALID_INTENTS:
+        initial_intent = "buying" if sample.get("scenario_type") == "buying" else "browsing"
+    intent_manager = IntentManager(initial_intent, threshold=intent_threshold)
     with agent_lock:
         agent.reset(session_id, sample["user_profile"])
     user_message = simulator.initial_message()
@@ -163,8 +177,16 @@ def _evaluate_sample(
             break
         if turn == MAX_TURNS:
             break
+        if reward_calculator is not None:
+            subscore = reward_calculator.score_turn(ranked, simulator.target, products)
+            if intent_manager.update(subscore):
+                query_handler = getattr(simulator, "query_handler", None)
+                if query_handler is not None:
+                    query_handler.set_intent(intent_manager.intent)
         user_message = simulator.next_message(response, turn + 1)
-    return simulator.result(hit_turn, best_rank), prompt_tokens, completion_tokens
+    result = simulator.result(hit_turn, best_rank)
+    result["final_intent"] = intent_manager.intent
+    return result, prompt_tokens, completion_tokens
 
 
 def evaluate(
@@ -177,6 +199,8 @@ def evaluate(
     checkpoint_path: str | Path | None = None,
     progress: bool = False,
     max_workers: int = 1,
+    reward_calculator: "RewardCalculator | None" = None,
+    intent_threshold: float | None = DEFAULT_INTENT_THRESHOLD,
 ) -> dict:
     reply_model = reply_model or TemplateReplyModel()
     if max_workers < 1:
@@ -194,6 +218,8 @@ def evaluate(
         products,
         reply_model,
         agent_lock,
+        reward_calculator,
+        intent_threshold,
     )
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -263,9 +289,33 @@ def main() -> None:
         default=None,
         help="Customer wording model; defaults to TECHJAM_REPLY_MODEL or template.",
     )
+    parser.add_argument(
+        "--intent-threshold",
+        type=float,
+        default=DEFAULT_INTENT_THRESHOLD,
+        help="Optional subscore threshold overriding both stage defaults.",
+    )
+    parser.add_argument(
+        "--embedding-provider",
+        choices=("gemini", "siliconflow"),
+        default=os.environ.get("EMBEDDING_PROVIDER", "gemini"),
+        help="Embedding API provider (defaults to EMBEDDING_PROVIDER or gemini).",
+    )
     args = parser.parse_args()
     samples = load_jsonl(args.dataset)
     catalog_ids, categories, products = catalog_index(args.catalog)
+    from scripts.reward_calculator import (
+        GeminiEmbeddingClient,
+        RewardCalculator,
+        SiliconFlowEmbeddingClient,
+    )
+
+    embedding_client = (
+        SiliconFlowEmbeddingClient()
+        if args.embedding_provider == "siliconflow"
+        else GeminiEmbeddingClient()
+    )
+    reward_calculator = RewardCalculator(embedding_client, text_fn=structured_product_text)
     result = evaluate(
         build_agent(args.agent, args.catalog),
         samples,
@@ -276,6 +326,8 @@ def main() -> None:
         checkpoint_path=args.checkpoint or f"{args.output}.partial",
         progress=args.progress,
         max_workers=args.workers,
+        reward_calculator=reward_calculator,
+        intent_threshold=args.intent_threshold,
     )
     Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: value for key, value in result.items() if key != "sessions"}, indent=2))

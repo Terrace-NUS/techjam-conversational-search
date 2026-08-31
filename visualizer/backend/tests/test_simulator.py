@@ -7,10 +7,32 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from scripts.intent_manager import IntentManager
 from visualizer.backend.app.main import SimulatorService, create_app
 
 
 class VisualizerApiTest(unittest.TestCase):
+    def test_turn_subscore_is_maximum_recommendation_score(self) -> None:
+        class FixedScores:
+            def score_turn(self, ranked, target, products):
+                return {"LOW": 0.2, "HIGH": 0.9}[ranked[0]]
+
+        service = SimulatorService.__new__(SimulatorService)
+        service.products = {"LOW": {}, "HIGH": {}, "TARGET": {}}
+        service.reward_calculators = {"gemini": FixedScores()}
+        session = {
+            "intent_manager": IntentManager("browsing"),
+            "embedding_provider": "gemini",
+            "target": "TARGET",
+            "debug": True,
+            "score_error": None,
+        }
+
+        metrics = service.turn_metrics(session, ["LOW", "HIGH"], update_intent=False)
+
+        self.assertEqual(metrics["recommendation_scores"], {"LOW": 0.2, "HIGH": 0.9})
+        self.assertEqual(metrics["subscore"], 0.9)
+
     def test_intent_override_redacts_target_and_only_scores_after_override(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -69,6 +91,11 @@ class VisualizerApiTest(unittest.TestCase):
                 view = response.json()
                 self.assertEqual(view["status"], "waiting_for_agent")
                 self.assertIsNone(view["turns"][0]["hit_rank"])
+                self.assertEqual(view["turns"][0]["subscore"], 1.0)
+                self.assertTrue(view["turns"][0]["intent_changed"])
+                self.assertEqual(view["metrics"]["current_intent"], "buying")
+                self.assertEqual(view["metrics"]["threshold"], 0.5)
+                self.assertEqual(view["turns"][0]["recommendation_scores"], {})
 
                 response = client.post(
                     f"/api/sessions/{view['id']}/turn",
@@ -98,9 +125,29 @@ class VisualizerApiTest(unittest.TestCase):
 
                 debug_view = client.post(
                     "/api/sessions",
-                    json={"sample_id": "override-1", "dataset": "samples", "debug": True},
+                    json={
+                        "sample_id": "override-1",
+                        "dataset": "samples",
+                        "embedding_provider": "siliconflow",
+                        "debug": True,
+                    },
                 ).json()
                 self.assertEqual(debug_view["debug_target_product"]["parent_asin"], "TARGET")
+                self.assertEqual(debug_view["embedding_provider"], "siliconflow")
+                client.post(f"/api/sessions/{debug_view['id']}/initialize")
+                debug_view = client.post(
+                    f"/api/sessions/{debug_view['id']}/turn",
+                    json={
+                        "message": "Try this.",
+                        "ask_attribute": "color",
+                        "recommendations": ["TARGET"],
+                    },
+                ).json()
+                self.assertEqual(
+                    debug_view["turns"][0]["recommendation_scores"],
+                    {"TARGET": 1.0},
+                )
+                self.assertEqual(debug_view["turns"][0]["queried_attribute"], "color")
 
                 human_view = client.post(
                     "/api/human-sessions",
@@ -179,6 +226,7 @@ class VisualizerApiTest(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 view = response.json()
                 self.assertEqual(view["turns"][0]["agent_message"], "")
+                self.assertIsNone(view["turns"][0]["queried_attribute"])
                 self.assertEqual(
                     view["current_user_message"],
                     "I don't have a preference for color; please use your judgment.",

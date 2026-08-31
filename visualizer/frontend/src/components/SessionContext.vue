@@ -33,7 +33,30 @@ const intentEntries = computed(() => Object.entries(props.session.human_context?
           <Badge variant="secondary">{{ session.sample.difficulty_bucket }}</Badge>
           <Badge variant="outline">{{ session.sample.category_bucket }}</Badge>
           <Badge v-if="session.agent" variant="outline">{{ session.agent }} agent</Badge>
+          <Badge v-if="session.debug" variant="outline">{{ session.embedding_provider }} embedding</Badge>
         </div>
+        <template v-if="session.debug">
+          <Separator />
+          <div class="grid grid-cols-3 gap-2 text-xs">
+            <div>
+              <p class="text-muted-foreground">Intent</p>
+              <p class="mt-1 font-medium capitalize">{{ session.metrics.current_intent }}</p>
+            </div>
+            <div>
+              <p class="text-muted-foreground">Latest score</p>
+              <p class="mt-1 font-mono font-medium">
+                {{ session.metrics.last_subscore === null ? '—' : session.metrics.last_subscore.toFixed(3) }}
+              </p>
+            </div>
+            <div>
+              <p class="text-muted-foreground">Threshold</p>
+              <p class="mt-1 font-mono font-medium">{{ session.metrics.threshold.toFixed(2) }}</p>
+            </div>
+          </div>
+          <p v-if="session.metrics.score_error" class="text-xs leading-5 text-amber-700 dark:text-amber-400">
+            Score unavailable: {{ session.metrics.score_error }}
+          </p>
+        </template>
         <template v-if="session.mode === 'human_as_agent'">
           <Separator />
           <div>
