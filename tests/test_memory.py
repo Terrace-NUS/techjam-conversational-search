@@ -10,6 +10,99 @@ from threadline_memory.schema import empty_profile
 
 
 class MemoryServiceTest(unittest.TestCase):
+    def test_same_subject_preferences_are_scoped_by_category(self) -> None:
+        profile = empty_profile("alice", created_at="2026-01-01T00:00:00Z")
+        outcome = merge_patch(
+            profile,
+            {
+                "preferences": {
+                    "attributes": [
+                        {
+                            "subject": "size",
+                            "value": "L",
+                            "category": "shirt",
+                            "source": "explicit",
+                        },
+                        {
+                            "subject": "size",
+                            "value": "42",
+                            "category": "shoes",
+                            "source": "explicit",
+                        },
+                    ]
+                }
+            },
+        )
+
+        by_category = {
+            item["category"]: item["value"]
+            for item in outcome.profile["shopping_preferences"]["attributes"]
+        }
+        self.assertEqual(by_category, {"shirt": "L", "shoes": "42"})
+
+    def test_category_scoped_budgets_coexist(self) -> None:
+        profile = empty_profile("alice", created_at="2026-01-01T00:00:00Z")
+        outcome = merge_patch(
+            profile,
+            {
+                "preferences": {
+                    "price": [
+                        {"value": 30, "category": "shirt", "source": "explicit"},
+                        {"value": 500, "category": "laptop", "source": "explicit"},
+                    ]
+                }
+            },
+        )
+
+        prices = outcome.profile["shopping_preferences"]["price"]
+        self.assertEqual({item["category"] for item in prices}, {"shirt", "laptop"})
+
+    def test_category_correction_does_not_remove_other_category(self) -> None:
+        profile = empty_profile("alice", created_at="2026-01-01T00:00:00Z")
+        profile = merge_patch(
+            profile,
+            {
+                "preferences": {
+                    "attributes": [
+                        {
+                            "subject": "size",
+                            "value": "L",
+                            "category": "shirt",
+                            "source": "explicit",
+                        },
+                        {
+                            "subject": "size",
+                            "value": "42",
+                            "category": "shoes",
+                            "source": "explicit",
+                        },
+                    ]
+                }
+            },
+        ).profile
+        outcome = merge_patch(
+            profile,
+            {
+                "corrections": [
+                    {
+                        "section": "attributes",
+                        "subject": "size",
+                        "category": "shoes",
+                        "superseded_values": ["42"],
+                        "final_value": "43",
+                        "source": "explicit",
+                        "evidence": "Actually my shoe size is 43.",
+                    }
+                ]
+            },
+        )
+
+        by_category = {
+            item["category"]: item["value"]
+            for item in outcome.profile["shopping_preferences"]["attributes"]
+        }
+        self.assertEqual(by_category, {"shirt": "L", "shoes": "43"})
+
     def test_shopping_preferences_alias_is_normalized(self) -> None:
         profile = empty_profile("alice", created_at="2026-01-01T00:00:00Z")
         outcome = merge_patch(

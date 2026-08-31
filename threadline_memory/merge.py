@@ -268,7 +268,7 @@ def _preference_entry(
     polarity = item.get("polarity", "positive")
     if polarity not in VALID_POLARITIES:
         polarity = "negative" if section == "negative_preferences" else "positive"
-    return {
+    entry: dict[str, Any] = {
         "subject": subject or value,
         "value": value or subject,
         "polarity": polarity,
@@ -276,13 +276,33 @@ def _preference_entry(
         "source": source,
         "evidence": _str(item.get("evidence")) or "",
     }
+    # A category scopes the entry to one product kind (e.g. shoes vs shirts), so
+    # a per-item requirement like size or budget does not collide across kinds.
+    # When absent the signal is a global taste and shares the (subject, None) slot.
+    category = _str(item.get("category"))
+    if category is not None:
+        entry["category"] = category
+    return entry
+
+
+def _preference_key(section: str, entry: dict[str, Any]) -> tuple[Any, Any]:
+    """The identity of "the same preference" within a section.
+
+    Subject-keyed sections (attributes/price/constraints) also key on
+    ``category`` so a per-kind requirement (shoe size vs shirt size) is a
+    distinct slot, while a category-less global taste keeps the ``(subject,
+    None)`` slot and is still overwritten on correction. Value-keyed sections
+    carry no category, so their key degenerates to the old single-field one.
+    """
+
+    key_field = _SECTION_KEYS[section]
+    return (entry.get(key_field), entry.get("category"))
 
 
 def _upsert_preference(bucket: list[dict[str, Any]], section: str, entry: dict[str, Any]) -> bool:
-    key_field = _SECTION_KEYS[section]
-    key = entry.get(key_field)
+    key = _preference_key(section, entry)
     for i, existing in enumerate(bucket):
-        if existing.get(key_field) == key:
+        if _preference_key(section, existing) == key:
             if existing == entry:
                 return False
             bucket[i] = entry
@@ -365,9 +385,15 @@ def _apply_corrections(profile: dict[str, Any], raw: Any, outcome: MergeOutcome)
         if not old_values:
             outcome.warnings.append("corrections[]: no superseded values; skipped")
             continue
+        # A category scopes the correction to one product kind: it only removes
+        # entries of that kind, so correcting a shoe size leaves the shirt size.
+        category = _str(item.get("category"))
         bucket = prefs[section]
         kept: list[dict[str, Any]] = []
         for entry in bucket:
+            if category is not None and _str(entry.get("category")) != category:
+                kept.append(entry)
+                continue
             is_old = any(_same_value(entry.get("value"), old) for old in old_values)
             same_subject = _same_value(entry.get("subject"), subject)
             is_final = final_value is not None and _same_value(entry.get("value"), final_value)
@@ -388,6 +414,8 @@ def _apply_corrections(profile: dict[str, Any], raw: Any, outcome: MergeOutcome)
             "source": "explicit",
             "evidence": evidence,
         }
+        if category is not None:
+            final_item["category"] = category
         if section == "price":
             final_item = _normalize_price_item(final_item)
         final_entry = _preference_entry(section, final_item, outcome)

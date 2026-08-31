@@ -125,6 +125,7 @@ def _attribute_priors(bucket: Any) -> list[dict[str, Any]]:
         {
             "subject": e.get("subject", e.get("value")),
             "value": e.get("value"),
+            "category": e.get("category"),
             "polarity": e.get("polarity", "positive"),
             "confidence": e.get("confidence", 0.5),
         }

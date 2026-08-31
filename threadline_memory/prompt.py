@@ -62,6 +62,13 @@ Hard rules:
    latest category unless the user clearly requests both categories.
 18. The only accepted top-level preference key is `preferences`; never emit
    `shopping_preferences` in a patch.
+19. On an `attributes`, `price`, or `constraints` entry, add a short `category`
+   (e.g. "shoes", "shirt", "laptop") when the requirement is about ONE product
+   kind — a size, color, material, or budget that applies only to that item.
+   OMIT `category` for a broad, kind-agnostic taste ("I like loose fits"). Two
+   entries with the same subject but different `category` are kept separately;
+   two with the same subject and no category overwrite each other. A correction
+   MUST carry the same `category` as the value it supersedes.
 
 Patch shape (all keys optional; NEVER include base_profile):
 {
@@ -69,8 +76,8 @@ Patch shape (all keys optional; NEVER include base_profile):
   "interests": [{"name": "...", "strength": 0.8, "confidence": 0.9, "source": "...", "evidence": "..."}],
   "preferences": {
     "categories": [{"value": "...", "polarity": "positive", "confidence": 0.7, "source": "...", "evidence": "..."}],
-    "attributes": [{"subject": "fit", "value": "loose", "polarity": "positive", "confidence": 0.8, "source": "explicit", "evidence": "..."}],
-    "price": [{"subject": "budget", "value": "under $60", "polarity": "positive", "confidence": 0.8, "source": "explicit", "evidence": "..."}],
+    "attributes": [{"subject": "size", "value": "L", "category": "shirt", "polarity": "positive", "confidence": 0.9, "source": "explicit", "evidence": "..."}],
+    "price": [{"subject": "budget", "value": "under $60", "category": "shoes", "polarity": "positive", "confidence": 0.8, "source": "explicit", "evidence": "..."}],
     "brands": [...], "constraints": [...], "negative_preferences": [...]
   },
   "recipient_cards": [
@@ -94,6 +101,7 @@ Each correction must have this shape:
 {
   "section": "categories|brands|attributes|price|constraints",
   "subject": "stable dimension such as style, material, budget, use_case",
+  "category": "product kind the correction is scoped to, or omit if global",
   "superseded_values": ["values present in the draft or earlier user turn"],
   "final_value": "the final corrected value, or null for a pure retraction",
   "source": "explicit",
