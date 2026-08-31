@@ -21,7 +21,6 @@ from evaluator.simulators import Simulator, V1Simulator, V2Simulator
 from starter.agent import Agent, build_agent
 from starter.baseline import BaselineAgent
 from starter.v1 import V1Agent
-from scripts.schema import Item
 
 
 class EchoTargetAgent:
@@ -231,11 +230,16 @@ class EvaluatorTest(unittest.TestCase):
             "A": {"parent_asin": "A", "title": "target shirt"},
             "B": {"parent_asin": "B", "title": "other shirt"},
         }
-        items = {
-            "A": Item(
-                item_id="A",
-                features=products["A"],
-                intent_descriptions={
+        sample = {
+            "version": "v2",
+            "sample_id": "intent_escalation_1",
+            "intent": "browsing",
+            "override": False,
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+            "item_id": "A",
+            "features": products["A"],
+            "intent_descriptions": {
                     "browsing": {
                         "style": "browsing style",
                         "material": "browsing material",
@@ -249,22 +253,18 @@ class EvaluatorTest(unittest.TestCase):
                         "size": "buying size",
                     },
                 },
-            )
+            "fake_attributes": {},
+            "correction_messages": {},
+            "modify_turn": None,
         }
         agent = IntentEscalationAgent()
         reward_calculator = FixedRewardCalculator(0.8)
         result = evaluate(
             agent,
-            [{
-                "sample_id": "intent_escalation_1",
-                "scenario_type": "browsing",
-                "user_profile": {},
-                "ground_truth": {"parent_asin": "A"},
-            }],
+            [sample],
             {"A", "B"},
             {"A": ["Clothing", "Shirts"]},
             products,
-            items=items,
             reward_calculator=reward_calculator,
             intent_threshold=0.5,
         )

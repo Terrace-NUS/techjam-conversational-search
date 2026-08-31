@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from evaluator.local_evaluator import (
+    DEFAULT_INTENT_THRESHOLD,
     MAX_TURNS,
     TOP_K,
     catalog_index,
@@ -20,7 +21,10 @@ from evaluator.local_evaluator import (
 )
 from evaluator.reply_model import ReplyModel, build_reply_model
 from evaluator.simulators import build_simulator
+from evaluator.simulators.v1 import searchable_text
 from starter.agent import Agent, build_agent
+from scripts.intent_manager import IntentManager
+from scripts.reward_calculator import GeminiEmbeddingClient, RewardCalculator
 
 
 AskAttribute = Literal[
@@ -202,8 +206,66 @@ class SimulatorService:
         }
         self.sessions: dict[str, dict] = {}
         self.agents: dict[str, Agent] = {}
+        self.reward_calculator: RewardCalculator | None = None
         # ponytail: one lock is enough for a local visualizer; split per session if contention appears.
         self.lock = Lock()
+
+    @staticmethod
+    def initial_intent(sample: dict) -> str:
+        intent = sample.get("intent")
+        if intent in {"browsing", "buying"}:
+            return intent
+        return "buying" if sample.get("scenario_type") == "buying" else "browsing"
+
+    def turn_metrics(self, session: dict, ranked: list[str], update_intent: bool) -> dict:
+        before = session["intent_manager"].intent
+        score_error = None
+        scores: dict[str, float | None] = {}
+        for parent_asin in ranked if session["debug"] else ranked[:1]:
+            if parent_asin == session["target"]:
+                scores[parent_asin] = 1.0
+                continue
+            if score_error is not None:
+                scores[parent_asin] = None
+                continue
+            try:
+                if self.reward_calculator is None:
+                    self.reward_calculator = RewardCalculator(
+                        GeminiEmbeddingClient(),
+                        text_fn=searchable_text,
+                    )
+                scores[parent_asin] = self.reward_calculator.score_turn(
+                    [parent_asin],
+                    session["target"],
+                    self.products,
+                )
+            except Exception as error:
+                scores[parent_asin] = None
+                score_error = str(error)
+        score = 0.0 if not ranked else scores.get(ranked[0])
+        changed = score is not None and update_intent and session["intent_manager"].update(score)
+        if changed:
+            query_handler = getattr(session.get("simulator"), "query_handler", None)
+            if query_handler is not None:
+                query_handler.set_intent(session["intent_manager"].intent)
+        session["score_error"] = score_error
+        return {
+            "subscore": score,
+            "intent_before": before,
+            "intent_after": session["intent_manager"].intent,
+            "intent_changed": changed,
+            "recommendation_scores": scores if session["debug"] else {},
+        }
+
+    @staticmethod
+    def metrics_view(session: dict) -> dict:
+        turns = session["turns"]
+        return {
+            "current_intent": session["intent_manager"].intent,
+            "threshold": session["intent_manager"].threshold,
+            "last_subscore": turns[-1]["subscore"] if turns else None,
+            "score_error": session["score_error"],
+        }
 
     @staticmethod
     def sample_summary(sample: dict) -> dict:
@@ -411,6 +473,11 @@ class SimulatorService:
             "reply_model_recorder": reply_model,
             "simulator": simulator,
             "target": target,
+            "intent_manager": IntentManager(
+                self.initial_intent(sample),
+                threshold=DEFAULT_INTENT_THRESHOLD,
+            ),
+            "score_error": None,
             "current_turn": 1,
             "current_user_message": None,
             "current_user_message_original": None,
@@ -529,7 +596,13 @@ class SimulatorService:
             "dataset": dataset_id,
             "agent_name": agent_name,
             "agent": None,
+            "debug": True,
             "target": target,
+            "intent_manager": IntentManager(
+                self.initial_intent(sample),
+                threshold=DEFAULT_INTENT_THRESHOLD,
+            ),
+            "score_error": None,
             "current_turn": 1,
             "turns": [],
             "outcome": None,
@@ -587,6 +660,12 @@ class SimulatorService:
             turn = session["current_turn"]
             target = session["target"]
             rank = recommendations.index(target) + 1 if target in recommendations else None
+            metrics = self.turn_metrics(
+                session,
+                recommendations,
+                update_intent=rank is None and turn < MAX_TURNS,
+            )
+            session["turns"][-1].update(metrics)
             if rank is not None or turn == MAX_TURNS:
                 session["turns"][-1]["hit_rank"] = rank
                 session["status"] = "hit" if rank is not None else "exhausted"
@@ -618,6 +697,11 @@ class SimulatorService:
                 else None
             )
             turn = session["current_turn"]
+            metrics = self.turn_metrics(
+                session,
+                ranked,
+                update_intent=hit_rank is None and turn < MAX_TURNS,
+            )
             session["turns"].append(
                 {
                     "user_message": session["current_user_message"],
@@ -626,6 +710,7 @@ class SimulatorService:
                     "ask_attribute": request.ask_attribute,
                     "recommendations": ranked,
                     "hit_rank": hit_rank,
+                    **metrics,
                 }
             )
 
@@ -686,6 +771,7 @@ class SimulatorService:
                 if session["debug"] and session["reply_model"] == "deepseek"
                 else None
             ),
+            "metrics": self.metrics_view(session),
             "turns": [
                 {
                     **turn,
@@ -723,7 +809,7 @@ class SimulatorService:
             "dataset": session["dataset"],
             "reply_model": None,
             "agent": session["agent_name"],
-            "debug": True,
+            "debug": session["debug"],
             "initialization_error": session["initialization_error"],
             "debug_target_product": self.product_detail(self.products[session["target"]]),
             "human_context": {
@@ -738,6 +824,7 @@ class SimulatorService:
             "current_turn": session["current_turn"],
             "current_user_message": None,
             "current_user_message_original": None,
+            "metrics": self.metrics_view(session),
             "turns": [
                 {
                     **turn,

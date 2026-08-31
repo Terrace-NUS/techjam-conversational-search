@@ -67,6 +67,12 @@ defineProps<{ session: SimulatorSession }>()
               <Badge v-if="turn.hit_rank" class="bg-emerald-600">
                 <CheckCircle2 class="size-3" /> rank {{ turn.hit_rank }}
               </Badge>
+              <Badge v-if="session.debug && turn.subscore !== null" variant="outline">
+                score {{ turn.subscore.toFixed(3) }}
+              </Badge>
+              <Badge v-if="session.debug && turn.intent_changed" class="bg-violet-600">
+                {{ turn.intent_before }} → {{ turn.intent_after }}
+              </Badge>
             </div>
             <div
               v-if="turn.agent_message.trim() || turn.ask_attribute"
@@ -97,6 +103,11 @@ defineProps<{ session: SimulatorSession }>()
                     referrerpolicy="no-referrer"
                   />
                   #{{ productIndex + 1 }} {{ product.parent_asin }}
+                  <span v-if="session.debug" class="font-mono opacity-70">
+                    · {{ turn.recommendation_scores[product.parent_asin] === null || turn.recommendation_scores[product.parent_asin] === undefined
+                      ? 'score —'
+                      : `score ${turn.recommendation_scores[product.parent_asin]?.toFixed(3)}` }}
+                  </span>
                 </Badge>
               </ProductDetailDialog>
             </div>

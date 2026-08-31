@@ -94,6 +94,18 @@ export interface TurnRecord {
   ask_attribute: AskAttribute | null
   recommendations: ProductSummary[]
   hit_rank: number | null
+  subscore: number | null
+  intent_before: 'browsing' | 'buying'
+  intent_after: 'browsing' | 'buying'
+  intent_changed: boolean
+  recommendation_scores: Record<string, number | null>
+}
+
+export interface SessionMetrics {
+  current_intent: 'browsing' | 'buying'
+  threshold: number
+  last_subscore: number | null
+  score_error: string | null
 }
 
 export interface SessionOutcome {
@@ -125,6 +137,7 @@ export interface SimulatorSession {
   current_turn: number
   current_user_message: string | null
   current_user_message_original: string | null
+  metrics: SessionMetrics
   human_context?: {
     intent: string
     override: boolean

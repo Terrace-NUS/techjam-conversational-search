@@ -69,6 +69,11 @@ class VisualizerApiTest(unittest.TestCase):
                 view = response.json()
                 self.assertEqual(view["status"], "waiting_for_agent")
                 self.assertIsNone(view["turns"][0]["hit_rank"])
+                self.assertEqual(view["turns"][0]["subscore"], 1.0)
+                self.assertTrue(view["turns"][0]["intent_changed"])
+                self.assertEqual(view["metrics"]["current_intent"], "buying")
+                self.assertEqual(view["metrics"]["threshold"], 0.5)
+                self.assertEqual(view["turns"][0]["recommendation_scores"], {})
 
                 response = client.post(
                     f"/api/sessions/{view['id']}/turn",
@@ -101,6 +106,15 @@ class VisualizerApiTest(unittest.TestCase):
                     json={"sample_id": "override-1", "dataset": "samples", "debug": True},
                 ).json()
                 self.assertEqual(debug_view["debug_target_product"]["parent_asin"], "TARGET")
+                client.post(f"/api/sessions/{debug_view['id']}/initialize")
+                debug_view = client.post(
+                    f"/api/sessions/{debug_view['id']}/turn",
+                    json={"message": "Try this.", "recommendations": ["TARGET"]},
+                ).json()
+                self.assertEqual(
+                    debug_view["turns"][0]["recommendation_scores"],
+                    {"TARGET": 1.0},
+                )
 
                 human_view = client.post(
                     "/api/human-sessions",

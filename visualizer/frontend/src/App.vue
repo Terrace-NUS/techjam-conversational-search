@@ -201,6 +201,11 @@ async function submit(input: AgentTurnInput, products: ProductSummary[]) {
           ask_attribute: input.ask_attribute,
           recommendations: products,
           hit_rank: null,
+          subscore: null,
+          intent_before: previousSession.metrics.current_intent,
+          intent_after: previousSession.metrics.current_intent,
+          intent_changed: false,
+          recommendation_scores: {},
         },
       ],
     }
