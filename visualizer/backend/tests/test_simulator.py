@@ -102,6 +102,42 @@ class VisualizerApiTest(unittest.TestCase):
                 ).json()
                 self.assertEqual(debug_view["debug_target_product"]["parent_asin"], "TARGET")
 
+                human_view = client.post(
+                    "/api/human-sessions",
+                    json={"sample_id": "override-1", "dataset": "samples", "agent": "baseline"},
+                ).json()
+                self.assertEqual(human_view["status"], "initializing")
+                human_view = client.post(
+                    f"/api/human-sessions/{human_view['id']}/initialize"
+                ).json()
+                self.assertEqual(human_view["status"], "waiting_for_simulator")
+                human_view = client.post(
+                    f"/api/human-sessions/{human_view['id']}/reply",
+                    json={"message": "I need a leather walking shoe."},
+                ).json()
+                self.assertEqual(human_view["status"], "hit")
+
+                auto_view = client.post(
+                    "/api/auto-sessions",
+                    json={
+                        "sample_id": "override-1",
+                        "dataset": "samples",
+                        "agent": "baseline",
+                        "reply_model": "template",
+                    },
+                ).json()
+                self.assertEqual(auto_view["mode"], "agent_simulator")
+                self.assertEqual(auto_view["agent"], "baseline")
+                auto_view = client.post(
+                    f"/api/auto-sessions/{auto_view['id']}/initialize"
+                ).json()
+                self.assertEqual(auto_view["status"], "waiting_for_agent")
+                auto_view = client.post(
+                    f"/api/auto-sessions/{auto_view['id']}/step"
+                ).json()
+                self.assertEqual(len(auto_view["turns"]), 1)
+                self.assertEqual(auto_view["current_turn"], 2)
+
     def test_boundary_reply_and_turn_limit_match_evaluator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

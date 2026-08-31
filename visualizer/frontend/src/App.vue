@@ -2,9 +2,23 @@
 import { nextTick, onMounted, ref, watch } from 'vue'
 import { CircleAlert, Moon, Palette, Sparkles, Sun } from '@lucide/vue'
 import { AnimatePresence, motion, MotionConfig, useAnimate } from 'motion-v'
-import { createSession, getDatasets, getSamples, initializeSession, submitAgentTurn } from './api'
+import {
+  createAutoSession,
+  createHumanSession,
+  createSession,
+  getDatasets,
+  getSamples,
+  initializeAutoSession,
+  initializeHumanSession,
+  initializeSession,
+  stepAutoSession,
+  submitAgentTurn,
+  submitHumanReply,
+} from './api'
 import AgentComposer from './components/AgentComposer.vue'
+import AutoConversationControls from './components/AutoConversationControls.vue'
 import ConversationTimeline from './components/ConversationTimeline.vue'
+import HumanSimulatorComposer from './components/HumanSimulatorComposer.vue'
 import SessionContext from './components/SessionContext.vue'
 import SessionSetup from './components/SessionSetup.vue'
 import { Badge } from '@/components/ui/badge'
@@ -20,8 +34,8 @@ import type {
   AgentTurnInput,
   DatasetOption,
   ProductSummary,
-  ReplyModel,
   SampleSummary,
+  SessionStartOptions,
   SimulatorSession,
 } from './types'
 
@@ -32,6 +46,7 @@ const samples = ref<SampleSummary[]>([])
 const datasets = ref<DatasetOption[]>([])
 const session = ref<SimulatorSession | null>(null)
 const loading = ref(false)
+const autoRunning = ref(false)
 const error = ref('')
 const composer = ref<InstanceType<typeof AgentComposer> | null>(null)
 const darkMode = ref(document.documentElement.classList.contains('dark'))
@@ -82,19 +97,29 @@ async function changeDataset(dataset: string) {
   }
 }
 
-async function start(
-  sampleId: string,
-  dataset: string,
-  replyModel: ReplyModel,
-  debug: boolean,
-) {
+async function start(options: SessionStartOptions) {
+  autoRunning.value = false
   loading.value = true
   error.value = ''
   try {
-    const created = await createSession(sampleId, dataset, replyModel, debug)
+    const created = options.mode === 'human_as_agent'
+      ? await createSession(options.sampleId, options.dataset, options.replyModel, options.debug)
+      : options.mode === 'human_as_simulator'
+        ? await createHumanSession(options.sampleId, options.dataset, options.agent)
+        : await createAutoSession(
+            options.sampleId,
+            options.dataset,
+            options.agent,
+            options.replyModel,
+            options.debug,
+          )
     session.value = created
     await nextTick()
-    const initialized = await initializeSession(created.id)
+    const initialized = options.mode === 'human_as_agent'
+      ? await initializeSession(created.id)
+      : options.mode === 'human_as_simulator'
+        ? await initializeHumanSession(created.id)
+        : await initializeAutoSession(created.id)
     if (session.value?.id !== created.id) return
     session.value = initialized
     if (session.value?.status === 'error') {
@@ -102,6 +127,56 @@ async function start(
     }
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : 'Could not start session'
+  } finally {
+    loading.value = false
+  }
+}
+
+async function advanceAuto(): Promise<boolean> {
+  if (!session.value || session.value.mode !== 'agent_simulator') return false
+  const sessionId = session.value.id
+  loading.value = true
+  error.value = ''
+  try {
+    const nextSession = await stepAutoSession(sessionId)
+    if (session.value?.id !== sessionId) return false
+    session.value = nextSession
+    await nextTick()
+    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })
+    return nextSession.status === 'waiting_for_agent'
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : 'Could not run the next turn'
+    return false
+  } finally {
+    loading.value = false
+  }
+}
+
+async function toggleAuto() {
+  if (autoRunning.value) {
+    autoRunning.value = false
+    return
+  }
+  autoRunning.value = true
+  try {
+    while (autoRunning.value && await advanceAuto()) {
+      await new Promise((resolve) => setTimeout(resolve, 900))
+    }
+  } finally {
+    autoRunning.value = false
+  }
+}
+
+async function replyAsSimulator(message: string) {
+  if (!session.value) return
+  const previousSession = session.value
+  loading.value = true
+  error.value = ''
+  try {
+    session.value = await submitHumanReply(previousSession.id, message)
+  } catch (cause) {
+    session.value = previousSession
+    error.value = cause instanceof Error ? cause.message : 'Could not get Agent response'
   } finally {
     loading.value = false
   }
@@ -147,6 +222,7 @@ async function submit(input: AgentTurnInput, products: ProductSummary[]) {
 }
 
 function reset() {
+  autoRunning.value = false
   session.value = null
   error.value = ''
 }
@@ -167,7 +243,9 @@ function reset() {
           </div>
         </div>
         <div class="flex items-center gap-2">
-          <Badge variant="outline" class="hidden sm:inline-flex">Human as Agent</Badge>
+          <Badge variant="outline" class="hidden sm:inline-flex">
+            {{ session?.mode === 'human_as_simulator' ? 'Human as Simulator' : session?.mode === 'agent_simulator' ? 'Agent ↔ Simulator' : 'Human as Agent' }}
+          </Badge>
           <Select v-model="themePalette">
             <SelectTrigger class="w-[8.5rem]" aria-label="Theme palette">
               <Palette class="size-4" />
@@ -244,17 +322,32 @@ function reset() {
           <SessionContext :session="session" class="xl:sticky xl:top-5" @reset="reset" />
           <ConversationTimeline :session="session" />
           <AgentComposer
-            v-if="session.status === 'waiting_for_agent'"
+            v-if="session.mode === 'human_as_agent' && session.status === 'waiting_for_agent'"
             ref="composer"
             class="xl:sticky xl:top-5"
             :loading="loading"
             @submit="submit"
           />
+          <HumanSimulatorComposer
+            v-else-if="session.mode === 'human_as_simulator' && session.status === 'waiting_for_simulator'"
+            :session="session"
+            :loading="loading"
+            class="xl:sticky xl:top-5"
+            @reply="replyAsSimulator"
+          />
+          <AutoConversationControls
+            v-else-if="session.mode === 'agent_simulator' && session.status === 'waiting_for_agent'"
+            :loading="loading"
+            :running="autoRunning"
+            class="xl:sticky xl:top-5"
+            @step="advanceAuto"
+            @toggle="toggleAuto"
+          />
           <div
             v-else-if="session.status === 'initializing'"
             class="rounded-xl border bg-card p-6 text-center text-sm text-muted-foreground"
           >
-            Simulator is preparing the first reply…
+            {{ session.mode === 'human_as_simulator' ? 'Preparing Agent…' : session.mode === 'agent_simulator' ? 'Preparing Agent and Simulator…' : 'Simulator is preparing the first reply…' }}
           </div>
           <div v-else class="rounded-xl border bg-card p-6 text-center text-sm text-muted-foreground">
             This session is complete. Review the target and conversation, or start a new case.

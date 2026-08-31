@@ -20,6 +20,7 @@ from evaluator.local_evaluator import (
 )
 from evaluator.reply_model import ReplyModel, build_reply_model
 from evaluator.simulators import build_simulator
+from starter.agent import Agent, build_agent
 
 
 AskAttribute = Literal[
@@ -53,6 +54,36 @@ class AgentTurnRequest(BaseModel):
     recommendations: list[str] = Field(default_factory=list, max_length=TOP_K)
 
 
+class CreateHumanSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sample_id: str = Field(min_length=1)
+    dataset: str | None = Field(default=None, min_length=1)
+    agent: Literal["baseline", "v1"] = "v1"
+
+
+class CreateAutoSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sample_id: str = Field(min_length=1)
+    dataset: str | None = Field(default=None, min_length=1)
+    agent: Literal["baseline", "v1"] = "v1"
+    reply_model: Literal["template", "deepseek"] = "deepseek"
+    debug: bool = False
+
+
+class HumanReplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = Field(min_length=1, max_length=2000)
+
+
+class RewriteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = Field(min_length=1, max_length=2000)
+
+
 SUMMARY_FIELDS = (
     "parent_asin",
     "title",
@@ -65,6 +96,10 @@ SUMMARY_FIELDS = (
 )
 DETAIL_FIELDS = ("features", "description", "details")
 SAMPLE_FIELDS = ("sample_id", "scenario_type", "difficulty_bucket", "category_bucket")
+ASK_ATTRIBUTE_VALUES = {
+    "category", "material", "color", "size", "style", "brand",
+    "budget", "feature", "use_case", "other",
+}
 
 
 class RecordingReplyModel(ReplyModel):
@@ -87,6 +122,7 @@ class RecordingReplyModel(ReplyModel):
 
 class SimulatorService:
     def __init__(self, catalog_path: str | Path, dataset_path: str | Path) -> None:
+        self.catalog_path = Path(catalog_path)
         self.catalog_ids, self.categories, self.products = catalog_index(catalog_path)
         self.thumbs_dir = Path(catalog_path).parent / "thumbs"
         local_thumbs = {
@@ -165,6 +201,7 @@ class SimulatorService:
             },
         }
         self.sessions: dict[str, dict] = {}
+        self.agents: dict[str, Agent] = {}
         # ponytail: one lock is enough for a local visualizer; split per session if contention appears.
         self.lock = Lock()
 
@@ -331,6 +368,12 @@ class SimulatorService:
             for _, _, parent_asin in sorted(matches)[offset : offset + limit]
         ]
 
+    def get_product(self, parent_asin: str) -> dict:
+        product = self.products.get(parent_asin)
+        if product is None:
+            raise HTTPException(status_code=404, detail="product not found")
+        return self.product_detail(product)
+
     def create_session(
         self,
         sample_id: str,
@@ -359,6 +402,7 @@ class SimulatorService:
         )
         session = {
             "id": session_id,
+            "mode": "human_as_agent",
             "status": "initializing",
             "sample": sample,
             "dataset": dataset_id,
@@ -396,6 +440,165 @@ class SimulatorService:
             session["current_user_message"] = message
             session["current_user_message_original"] = session["reply_model_recorder"].original
             session["status"] = "waiting_for_agent"
+            return self.session_view(session)
+
+    def create_auto_session(
+        self,
+        sample_id: str,
+        dataset_id: str,
+        agent_name: str,
+        reply_model_name: str,
+        debug: bool = False,
+    ) -> dict:
+        view = self.create_session(sample_id, dataset_id, reply_model_name, debug)
+        with self.lock:
+            session = self.sessions[view["id"]]
+            session["mode"] = "agent_simulator"
+            session["agent_name"] = agent_name
+            session["agent"] = None
+            return self.session_view(session)
+
+    def initialize_auto_session(self, session_id: str) -> dict:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None or session.get("mode") != "agent_simulator":
+                raise HTTPException(status_code=404, detail="automatic session not found")
+            if session["status"] != "initializing":
+                return self.session_view(session)
+            agent_name = session["agent_name"]
+        try:
+            agent = self.agents.get(agent_name) or build_agent(agent_name, self.catalog_path)
+            self.agents[agent_name] = agent
+            agent.reset(session_id, session["sample"]["user_profile"])
+        except Exception as error:
+            with self.lock:
+                session["status"] = "error"
+                session["initialization_error"] = str(error)
+                return self.session_view(session)
+        with self.lock:
+            session["agent"] = agent
+        return self.initialize_session(session_id)
+
+    def step_auto_session(self, session_id: str) -> dict:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None or session.get("mode") != "agent_simulator":
+                raise HTTPException(status_code=404, detail="automatic session not found")
+            if session["status"] != "waiting_for_agent":
+                raise HTTPException(status_code=409, detail="session is not ready for a turn")
+            agent = session["agent"]
+            user_message = session["current_user_message"]
+            turn = session["current_turn"]
+        response = agent.respond(session_id, user_message, turn, TOP_K)
+        response = response if isinstance(response, dict) else {}
+        ask_attribute = response.get("ask_attribute")
+        recommendations = normalize_recommendations(
+            response.get("recommendations"),
+            self.catalog_ids,
+        )
+        return self.submit_turn(
+            session_id,
+            AgentTurnRequest(
+                message=str(response.get("message") or ""),
+                ask_attribute=ask_attribute if ask_attribute in ASK_ATTRIBUTE_VALUES else None,
+                recommendations=recommendations,
+            ),
+        )
+
+    def create_human_session(
+        self,
+        sample_id: str,
+        dataset_id: str,
+        agent_name: str,
+    ) -> dict:
+        samples = self.datasets.get(dataset_id)
+        if samples is None:
+            raise HTTPException(status_code=404, detail="dataset not found")
+        sample = samples.get(sample_id)
+        if sample is None:
+            raise HTTPException(status_code=404, detail="sample not found")
+        target = str(sample["ground_truth"]["parent_asin"])
+        if target not in self.products:
+            raise RuntimeError(f"target product {target!r} is missing from the catalog")
+        session_id = uuid4().hex
+        session = {
+            "id": session_id,
+            "mode": "human_as_simulator",
+            "status": "initializing",
+            "sample": sample,
+            "dataset": dataset_id,
+            "agent_name": agent_name,
+            "agent": None,
+            "target": target,
+            "current_turn": 1,
+            "turns": [],
+            "outcome": None,
+            "initialization_error": None,
+        }
+        with self.lock:
+            self.sessions[session_id] = session
+        return self.session_view(session)
+
+    def initialize_human_session(self, session_id: str) -> dict:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None or session.get("mode") != "human_as_simulator":
+                raise HTTPException(status_code=404, detail="human simulator session not found")
+            if session["status"] != "initializing":
+                return self.session_view(session)
+            agent_name = session["agent_name"]
+        try:
+            agent = self.agents.get(agent_name) or build_agent(agent_name, self.catalog_path)
+            self.agents[agent_name] = agent
+            agent.reset(session_id, session["sample"]["user_profile"])
+        except Exception as error:
+            with self.lock:
+                session["status"] = "error"
+                session["initialization_error"] = str(error)
+                return self.session_view(session)
+        with self.lock:
+            session["agent"] = agent
+            session["status"] = "waiting_for_simulator"
+            return self.session_view(session)
+
+    def submit_human_reply(self, session_id: str, message: str) -> dict:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None or session.get("mode") != "human_as_simulator":
+                raise HTTPException(status_code=404, detail="human simulator session not found")
+            if session["status"] != "waiting_for_simulator":
+                raise HTTPException(status_code=409, detail="session is not waiting for a reply")
+            response = session["agent"].respond(session_id, message, session["current_turn"], TOP_K)
+            recommendations = normalize_recommendations(
+                response.get("recommendations") if isinstance(response, dict) else None,
+                self.catalog_ids,
+            )
+            ask_attribute = response.get("ask_attribute") if isinstance(response, dict) else None
+            session["turns"].append(
+                {
+                    "user_message": message,
+                    "user_message_original": None,
+                    "agent_message": str(response.get("message") or "") if isinstance(response, dict) else "",
+                    "ask_attribute": ask_attribute if ask_attribute in ASK_ATTRIBUTE_VALUES else None,
+                    "recommendations": recommendations,
+                    "hit_rank": None,
+                }
+            )
+            turn = session["current_turn"]
+            target = session["target"]
+            rank = recommendations.index(target) + 1 if target in recommendations else None
+            if rank is not None or turn == MAX_TURNS:
+                session["turns"][-1]["hit_rank"] = rank
+                session["status"] = "hit" if rank is not None else "exhausted"
+                session["outcome"] = {
+                    "hit": rank is not None,
+                    "first_hit_turn": turn if rank is not None else None,
+                    "best_rank": rank,
+                    "reciprocal_rank": 0.0 if rank is None else 1.0 / rank,
+                }
+            else:
+                session["current_turn"] = turn + 1
+                session["status"] = "waiting_for_simulator"
             return self.session_view(session)
 
     def submit_turn(self, session_id: str, request: AgentTurnRequest) -> dict:
@@ -452,6 +655,8 @@ class SimulatorService:
             return self.session_view(session)
 
     def session_view(self, session: dict) -> dict:
+        if session.get("mode") == "human_as_simulator":
+            return self.human_session_view(session)
         outcome = None
         if session["outcome"] is not None:
             outcome = {
@@ -460,10 +665,12 @@ class SimulatorService:
             }
         return {
             "id": session["id"],
+            "mode": session["mode"],
             "status": session["status"],
             "sample": self.sample_summary(session["sample"]),
             "dataset": session["dataset"],
             "reply_model": session["reply_model"],
+            "agent": session.get("agent_name"),
             "debug": session["debug"],
             "initialization_error": session["initialization_error"],
             "debug_target_product": (
@@ -487,6 +694,53 @@ class SimulatorService:
                         if session["debug"] and session["reply_model"] == "deepseek"
                         else None
                     ),
+                    "recommendations": [
+                        self.product_summary(self.products[parent_asin])
+                        for parent_asin in turn["recommendations"]
+                    ],
+                }
+                for turn in session["turns"]
+            ],
+            "outcome": outcome,
+        }
+
+    def human_session_view(self, session: dict) -> dict:
+        sample = session["sample"]
+        intent = sample.get("intent") or sample.get("scenario_type")
+        descriptions = sample.get("intent_descriptions") or {}
+        intent_description = descriptions.get(intent) if isinstance(descriptions, dict) else None
+        outcome = None
+        if session["outcome"] is not None:
+            outcome = {
+                **session["outcome"],
+                "target_product": self.product_summary(self.products[session["target"]]),
+            }
+        return {
+            "id": session["id"],
+            "mode": session["mode"],
+            "status": session["status"],
+            "sample": self.sample_summary(sample),
+            "dataset": session["dataset"],
+            "reply_model": None,
+            "agent": session["agent_name"],
+            "debug": True,
+            "initialization_error": session["initialization_error"],
+            "debug_target_product": self.product_detail(self.products[session["target"]]),
+            "human_context": {
+                "intent": intent,
+                "override": bool(sample.get("override")),
+                "intent_description": intent_description,
+                "fake_attributes": sample.get("fake_attributes") or {},
+                "correction_messages": sample.get("correction_messages") or {},
+                "modify_turn": sample.get("modify_turn"),
+            },
+            "user_profile": sample["user_profile"],
+            "current_turn": session["current_turn"],
+            "current_user_message": None,
+            "current_user_message_original": None,
+            "turns": [
+                {
+                    **turn,
                     "recommendations": [
                         self.product_summary(self.products[parent_asin])
                         for parent_asin in turn["recommendations"]
@@ -562,6 +816,10 @@ def create_app(
     def catalog_filters() -> dict:
         return simulator().filter_options
 
+    @app.get("/api/catalog/{parent_asin}")
+    def catalog_product(parent_asin: str) -> dict:
+        return simulator().get_product(parent_asin)
+
     @app.post("/api/sessions", status_code=201)
     def create_session(request: CreateSessionRequest) -> dict:
         try:
@@ -577,6 +835,50 @@ def create_app(
     @app.post("/api/sessions/{session_id}/initialize")
     def initialize_session(session_id: str) -> dict:
         return simulator().initialize_session(session_id)
+
+    @app.post("/api/auto-sessions", status_code=201)
+    def create_auto_session(request: CreateAutoSessionRequest) -> dict:
+        try:
+            return simulator().create_auto_session(
+                request.sample_id,
+                request.dataset or simulator().default_dataset,
+                request.agent,
+                request.reply_model,
+                request.debug,
+            )
+        except (RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/auto-sessions/{session_id}/initialize")
+    def initialize_auto_session(session_id: str) -> dict:
+        return simulator().initialize_auto_session(session_id)
+
+    @app.post("/api/auto-sessions/{session_id}/step")
+    def step_auto_session(session_id: str) -> dict:
+        return simulator().step_auto_session(session_id)
+
+    @app.post("/api/human-sessions", status_code=201)
+    def create_human_session(request: CreateHumanSessionRequest) -> dict:
+        return simulator().create_human_session(
+            request.sample_id,
+            request.dataset or simulator().default_dataset,
+            request.agent,
+        )
+
+    @app.post("/api/human-sessions/{session_id}/initialize")
+    def initialize_human_session(session_id: str) -> dict:
+        return simulator().initialize_human_session(session_id)
+
+    @app.post("/api/human-sessions/{session_id}/reply")
+    def submit_human_reply(session_id: str, request: HumanReplyRequest) -> dict:
+        return simulator().submit_human_reply(session_id, request.message)
+
+    @app.post("/api/rewrite")
+    def rewrite_message(request: RewriteRequest) -> dict:
+        try:
+            return {"message": build_reply_model("deepseek").rewrite_query_answer(request.message)}
+        except (RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/api/sessions/{session_id}/turn")
     def submit_turn(session_id: str, request: AgentTurnRequest) -> dict:

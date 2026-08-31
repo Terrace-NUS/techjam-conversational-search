@@ -2,7 +2,6 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import {
   ChevronDown,
-  ChevronRight,
   ChevronUp,
   LoaderCircle,
   PackageSearch,
@@ -23,6 +22,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import ProductDetailDialog from './ProductDetailDialog.vue'
 import type { CatalogFilters, CatalogSearchInput, ProductSummary } from '@/types'
 
 const PAGE_SIZE = 40
@@ -53,7 +53,6 @@ const loading = ref(false)
 const loadingMore = ref(false)
 const hasMore = ref(false)
 const error = ref('')
-const expandedId = ref('')
 let timer: ReturnType<typeof setTimeout> | undefined
 let controller: AbortController | undefined
 
@@ -310,19 +309,21 @@ function matchingFeatures(product: ProductSummary): Array<{ feature: string; ind
               class="h-full min-w-0 rounded-xl border bg-card p-4 shadow-xs"
             >
               <div class="flex items-start gap-3">
-                <img
-                  v-if="product.thumb"
-                  :src="product.thumb"
-                  alt=""
-                  class="size-14 shrink-0 rounded-lg border bg-white object-contain p-1"
-                  loading="lazy"
-                  decoding="async"
-                  referrerpolicy="no-referrer"
-                />
-                <div v-else class="grid size-14 shrink-0 place-items-center rounded-lg border bg-muted text-muted-foreground">
-                  <PackageSearch class="size-5" />
-                </div>
-                <div class="min-w-0 flex-1 space-y-2">
+                <ProductDetailDialog :product="product">
+                  <button type="button" class="flex min-w-0 flex-1 items-start gap-3 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                    <img
+                      v-if="product.thumb"
+                      :src="product.thumb"
+                      alt=""
+                      class="size-14 shrink-0 rounded-lg border bg-white object-contain p-1"
+                      loading="lazy"
+                      decoding="async"
+                      referrerpolicy="no-referrer"
+                    />
+                    <div v-else class="grid size-14 shrink-0 place-items-center rounded-lg border bg-muted text-muted-foreground">
+                      <PackageSearch class="size-5" />
+                    </div>
+                    <div class="min-w-0 flex-1 space-y-2">
                   <div>
                     <p class="line-clamp-2 text-sm font-medium leading-5">
                       <template v-for="(segment, index) in highlight(product.title)" :key="index">
@@ -357,7 +358,9 @@ function matchingFeatures(product: ProductSummary): Array<{ feature: string; ind
                       </template>
                     </p>
                   </div>
-                </div>
+                    </div>
+                  </button>
+                </ProductDetailDialog>
                 <Button
                   type="button"
                   size="sm"
@@ -370,40 +373,6 @@ function matchingFeatures(product: ProductSummary): Array<{ feature: string; ind
                   <Plus v-else class="size-4" />
                   {{ selectedIds.has(product.parent_asin) ? 'Remove' : 'Add' }}
                 </Button>
-              </div>
-
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                class="mt-2 px-1 text-muted-foreground"
-                :aria-expanded="expandedId === product.parent_asin"
-                @click="expandedId = expandedId === product.parent_asin ? '' : product.parent_asin"
-              >
-                <ChevronDown v-if="expandedId === product.parent_asin" class="size-4" />
-                <ChevronRight v-else class="size-4" />
-                {{ expandedId === product.parent_asin ? 'Hide details' : 'Details' }}
-              </Button>
-
-              <div
-                v-if="expandedId === product.parent_asin"
-                class="mt-2 space-y-3 border-t pt-3 text-xs leading-5 text-muted-foreground"
-              >
-                <p v-for="paragraph in product.description ?? []" :key="paragraph">{{ paragraph }}</p>
-                <ul v-if="product.features?.length" class="list-disc space-y-1 pl-4">
-                  <li v-for="feature in product.features" :key="feature">
-                    <template v-for="(segment, index) in highlight(feature)" :key="index">
-                      <mark v-if="segment.matched" class="rounded-sm bg-yellow-200 text-inherit dark:bg-yellow-500/40">{{ segment.text }}</mark>
-                      <span v-else>{{ segment.text }}</span>
-                    </template>
-                  </li>
-                </ul>
-                <dl v-if="Object.keys(product.details ?? {}).length" class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
-                  <template v-for="(value, key) in product.details" :key="key">
-                    <dt class="font-medium text-foreground">{{ key }}</dt>
-                    <dd>{{ value }}</dd>
-                  </template>
-                </dl>
               </div>
               </article>
             </div>
@@ -434,19 +403,23 @@ function matchingFeatures(product: ProductSummary): Array<{ feature: string; ind
         class="flex items-center gap-2 rounded-md border bg-card p-2"
       >
         <Badge variant="secondary" class="w-7 justify-center">{{ index + 1 }}</Badge>
-        <img
-          v-if="product.thumb"
-          :src="product.thumb"
-          alt=""
-          class="size-9 shrink-0 rounded-md border bg-white object-contain p-0.5"
-          loading="lazy"
-          decoding="async"
-          referrerpolicy="no-referrer"
-        />
-        <div class="min-w-0 flex-1">
-          <p class="truncate text-xs font-medium">{{ product.title }}</p>
-          <p class="font-mono text-[11px] text-muted-foreground">{{ product.parent_asin }}</p>
-        </div>
+        <ProductDetailDialog :product="product">
+          <button type="button" class="flex min-w-0 flex-1 items-center gap-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            <img
+              v-if="product.thumb"
+              :src="product.thumb"
+              alt=""
+              class="size-9 shrink-0 rounded-md border bg-white object-contain p-0.5"
+              loading="lazy"
+              decoding="async"
+              referrerpolicy="no-referrer"
+            />
+            <div class="min-w-0 flex-1">
+              <p class="truncate text-xs font-medium">{{ product.title }}</p>
+              <p class="font-mono text-[11px] text-muted-foreground">{{ product.parent_asin }}</p>
+            </div>
+          </button>
+        </ProductDetailDialog>
         <div class="flex">
           <Button type="button" size="icon-sm" variant="ghost" :disabled="index === 0" aria-label="Move up" @click="move(index, -1)">
             <ChevronUp class="size-3.5" />

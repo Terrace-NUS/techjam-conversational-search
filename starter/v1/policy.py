@@ -82,7 +82,7 @@ class ConversationPolicy:
         # A Top-1 guess is free while asking: a correct guess converts at Rank 1;
         # a wrong guess still receives the clarification response.
         if question is not None and turn < 10:
-            return [result.pids[0]]
+            return result.pids[:top_k]
 
         unseen = [pid for pid in result.pids if pid not in state.emitted_pids]
         if not unseen:

@@ -1,5 +1,6 @@
 import type {
   AgentTurnInput,
+  AgentName,
   CatalogFilters,
   CatalogSearchInput,
   DatasetOption,
@@ -46,6 +47,60 @@ export function initializeSession(sessionId: string): Promise<SimulatorSession> 
   return request(`/api/sessions/${encodeURIComponent(sessionId)}/initialize`, { method: 'POST' })
 }
 
+export function createAutoSession(
+  sampleId: string,
+  dataset: string,
+  agent: AgentName,
+  replyModel: ReplyModel,
+  debug: boolean,
+): Promise<SimulatorSession> {
+  return request('/api/auto-sessions', {
+    method: 'POST',
+    body: JSON.stringify({ sample_id: sampleId, dataset, agent, reply_model: replyModel, debug }),
+  })
+}
+
+export function initializeAutoSession(sessionId: string): Promise<SimulatorSession> {
+  return request(`/api/auto-sessions/${encodeURIComponent(sessionId)}/initialize`, {
+    method: 'POST',
+  })
+}
+
+export function stepAutoSession(sessionId: string): Promise<SimulatorSession> {
+  return request(`/api/auto-sessions/${encodeURIComponent(sessionId)}/step`, { method: 'POST' })
+}
+
+export function createHumanSession(
+  sampleId: string,
+  dataset: string,
+  agent: AgentName,
+): Promise<SimulatorSession> {
+  return request('/api/human-sessions', {
+    method: 'POST',
+    body: JSON.stringify({ sample_id: sampleId, dataset, agent }),
+  })
+}
+
+export function initializeHumanSession(sessionId: string): Promise<SimulatorSession> {
+  return request(`/api/human-sessions/${encodeURIComponent(sessionId)}/initialize`, {
+    method: 'POST',
+  })
+}
+
+export function submitHumanReply(
+  sessionId: string,
+  message: string,
+): Promise<SimulatorSession> {
+  return request(`/api/human-sessions/${encodeURIComponent(sessionId)}/reply`, {
+    method: 'POST',
+    body: JSON.stringify({ message }),
+  })
+}
+
+export function rewriteMessage(message: string): Promise<{ message: string }> {
+  return request('/api/rewrite', { method: 'POST', body: JSON.stringify({ message }) })
+}
+
 export function submitAgentTurn(
   sessionId: string,
   input: AgentTurnInput,
@@ -58,6 +113,10 @@ export function submitAgentTurn(
 
 export function getCatalogFilters(): Promise<CatalogFilters> {
   return request('/api/catalog/filters')
+}
+
+export function getProduct(parentAsin: string): Promise<ProductSummary> {
+  return request(`/api/catalog/${encodeURIComponent(parentAsin)}`)
 }
 
 export function searchCatalog(

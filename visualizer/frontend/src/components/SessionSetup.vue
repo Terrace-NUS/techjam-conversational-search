@@ -17,7 +17,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import type { DatasetOption, ReplyModel, SampleSummary } from '@/types'
+import type {
+  AgentName,
+  DatasetOption,
+  ReplyModel,
+  SampleSummary,
+  SessionMode,
+  SessionStartOptions,
+} from '@/types'
 
 const props = defineProps<{
   samples: SampleSummary[]
@@ -26,14 +33,16 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  start: [sampleId: string, dataset: string, replyModel: ReplyModel, debug: boolean]
+  start: [options: SessionStartOptions]
   datasetChange: [dataset: string]
 }>()
 
 const scenario = ref('all')
 const selectedId = ref('')
 const dataset = ref('')
+const mode = ref<SessionMode>('human_as_agent')
 const replyModel = ref<ReplyModel>('deepseek')
+const agent = ref<AgentName>('v1')
 const debug = ref(false)
 
 const scenarios = computed(() => [
@@ -76,17 +85,38 @@ watch(
   <Card class="w-full max-w-2xl border-0 shadow-xl shadow-slate-200/60 dark:shadow-black/30">
     <CardHeader class="space-y-3">
       <div class="flex items-center gap-2">
-        <Badge variant="secondary">Human as Agent</Badge>
-        <Badge variant="outline">{{ replyModel === 'deepseek' ? 'DeepSeek replies' : 'Template replies' }}</Badge>
+        <Badge variant="secondary">
+          {{ mode === 'human_as_agent' ? 'Human as Agent' : mode === 'human_as_simulator' ? 'Human as Simulator' : 'Agent ↔ Simulator' }}
+        </Badge>
+        <Badge variant="outline">
+          {{ mode === 'human_as_agent' ? (replyModel === 'deepseek' ? 'DeepSeek replies' : 'Template replies') : mode === 'human_as_simulator' ? `${agent} agent` : `${agent} · ${replyModel}` }}
+        </Badge>
       </div>
       <CardTitle class="text-2xl">Start a product-guessing session</CardTitle>
       <CardDescription class="max-w-xl leading-6">
-        You will see exactly what an Agent sees. Ask one structured question, rank up to
-        ten products, and find the hidden target within ten turns.
+        {{ mode === 'human_as_agent'
+          ? 'Ask structured questions, rank products, and find the hidden target within ten turns.'
+          : mode === 'human_as_simulator'
+            ? 'Reply as the customer and inspect the Agent recommendations.'
+            : 'Watch the Agent and Simulator converse automatically, or advance them one turn at a time.' }}
       </CardDescription>
     </CardHeader>
     <CardContent class="space-y-5">
       <div class="grid gap-4 sm:grid-cols-2">
+        <div class="grid gap-2 text-sm font-medium sm:col-span-2">
+          <label for="mode-select">Mode</label>
+          <Select v-model="mode">
+            <SelectTrigger id="mode-select" class="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="human_as_agent">Human as Agent</SelectItem>
+              <SelectItem value="human_as_simulator">Human as Simulator</SelectItem>
+              <SelectItem value="agent_simulator">Agent ↔ Simulator</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
         <div class="grid gap-2 text-sm font-medium">
           <label for="dataset-select">Dataset</label>
           <Select v-model="dataset">
@@ -101,7 +131,7 @@ watch(
           </Select>
         </div>
 
-        <div class="grid gap-2 text-sm font-medium">
+        <div v-if="mode !== 'human_as_simulator'" class="grid gap-2 text-sm font-medium">
           <label for="reply-model-select">Reply model</label>
           <Select v-model="replyModel">
             <SelectTrigger id="reply-model-select" class="w-full">
@@ -110,6 +140,19 @@ watch(
             <SelectContent>
               <SelectItem value="template">Template</SelectItem>
               <SelectItem value="deepseek">DeepSeek</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div v-if="mode !== 'human_as_agent'" class="grid gap-2 text-sm font-medium">
+          <label for="agent-select">Agent</label>
+          <Select v-model="agent">
+            <SelectTrigger id="agent-select" class="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="v1">V1</SelectItem>
+              <SelectItem value="baseline">Baseline</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -147,7 +190,10 @@ watch(
         </div>
       </div>
 
-      <div class="rounded-lg border bg-muted/40 p-4 text-sm text-muted-foreground">
+      <div
+        v-if="mode !== 'human_as_simulator'"
+        class="rounded-lg border bg-muted/40 p-4 text-sm text-muted-foreground"
+      >
         <label class="flex cursor-pointer items-start gap-3">
           <input v-model="debug" type="checkbox" class="mt-0.5 size-4 accent-primary" />
           <span>
@@ -161,7 +207,7 @@ watch(
         class="w-full"
         size="lg"
         :disabled="loading || !selectedId || !dataset"
-        @click="emit('start', selectedId, dataset, replyModel, debug)"
+        @click="emit('start', { mode, sampleId: selectedId, dataset, replyModel, agent, debug })"
       >
         <Play class="size-4" />
         {{ loading ? 'Starting…' : 'Start session' }}

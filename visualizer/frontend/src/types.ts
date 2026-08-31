@@ -28,6 +28,17 @@ export interface DatasetOption {
 }
 
 export type ReplyModel = 'template' | 'deepseek'
+export type AgentName = 'baseline' | 'v1'
+export type SessionMode = 'human_as_agent' | 'human_as_simulator' | 'agent_simulator'
+
+export interface SessionStartOptions {
+  mode: SessionMode
+  sampleId: string
+  dataset: string
+  replyModel: ReplyModel
+  agent: AgentName
+  debug: boolean
+}
 
 export interface ProductSummary {
   parent_asin: string
@@ -95,9 +106,17 @@ export interface SessionOutcome {
 
 export interface SimulatorSession {
   id: string
-  status: 'initializing' | 'waiting_for_agent' | 'hit' | 'exhausted' | 'error'
+  mode: SessionMode
+  status:
+    | 'initializing'
+    | 'waiting_for_agent'
+    | 'waiting_for_simulator'
+    | 'hit'
+    | 'exhausted'
+    | 'error'
   dataset: string
-  reply_model: ReplyModel
+  reply_model: ReplyModel | null
+  agent?: AgentName
   debug: boolean
   initialization_error: string | null
   debug_target_product: ProductSummary | null
@@ -106,6 +125,14 @@ export interface SimulatorSession {
   current_turn: number
   current_user_message: string | null
   current_user_message_original: string | null
+  human_context?: {
+    intent: string
+    override: boolean
+    intent_description: Record<string, string> | null
+    fake_attributes: Record<string, unknown>
+    correction_messages: Record<string, unknown>
+    modify_turn: number | null
+  }
   turns: TurnRecord[]
   outcome: SessionOutcome | null
 }

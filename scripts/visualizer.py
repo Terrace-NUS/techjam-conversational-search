@@ -14,12 +14,25 @@ ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "visualizer" / "frontend"
 
 
-def start(command: list[str], cwd: Path) -> subprocess.Popen:
-    options = (
-        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        if os.name == "nt"
-        else {"start_new_session": True}
-    )
+def start(
+    command: list[str],
+    cwd: Path,
+    isolated_console: bool = False,
+) -> subprocess.Popen:
+    options: dict = {}
+    if os.name == "nt":
+        options["creationflags"] = (
+            subprocess.CREATE_NEW_CONSOLE
+            if isolated_console
+            else subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+        if isolated_console:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            options["startupinfo"] = startupinfo
+    else:
+        options["start_new_session"] = True
     return subprocess.Popen(command, cwd=cwd, **options)
 
 
@@ -65,11 +78,10 @@ def main() -> int:
     ]
     if args.reload:
         backend_command.append("--reload")
-
     processes: list[subprocess.Popen] = []
     exit_code = 0
     try:
-        processes.append(start(backend_command, ROOT))
+        processes.append(start(backend_command, ROOT, isolated_console=args.reload))
         processes.append(start([pnpm, "dev"], FRONTEND))
         while all(process.poll() is None for process in processes):
             time.sleep(0.2)
