@@ -2,7 +2,9 @@ import type {
   AgentTurnInput,
   CatalogFilters,
   CatalogSearchInput,
+  DatasetOption,
   ProductSummary,
+  ReplyModel,
   SampleSummary,
   SimulatorSession,
 } from './types'
@@ -20,14 +22,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
-export function getSamples(): Promise<SampleSummary[]> {
-  return request('/api/samples')
+export function getDatasets(): Promise<DatasetOption[]> {
+  return request('/api/datasets')
 }
 
-export function createSession(sampleId: string): Promise<SimulatorSession> {
+export function getSamples(dataset: string): Promise<SampleSummary[]> {
+  return request(`/api/samples?dataset=${encodeURIComponent(dataset)}`)
+}
+
+export function createSession(
+  sampleId: string,
+  dataset: string,
+  replyModel: ReplyModel,
+): Promise<SimulatorSession> {
   return request('/api/sessions', {
     method: 'POST',
-    body: JSON.stringify({ sample_id: sampleId }),
+    body: JSON.stringify({ sample_id: sampleId, dataset, reply_model: replyModel }),
   })
 }
 

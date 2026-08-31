@@ -2,7 +2,7 @@
 import { nextTick, onMounted, ref, watch } from 'vue'
 import { CircleAlert, Moon, Palette, Sparkles, Sun } from '@lucide/vue'
 import { AnimatePresence, motion, MotionConfig, useAnimate } from 'motion-v'
-import { createSession, getSamples, submitAgentTurn } from './api'
+import { createSession, getDatasets, getSamples, submitAgentTurn } from './api'
 import AgentComposer from './components/AgentComposer.vue'
 import ConversationTimeline from './components/ConversationTimeline.vue'
 import SessionContext from './components/SessionContext.vue'
@@ -16,12 +16,20 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import type { AgentTurnInput, ProductSummary, SampleSummary, SimulatorSession } from './types'
+import type {
+  AgentTurnInput,
+  DatasetOption,
+  ProductSummary,
+  ReplyModel,
+  SampleSummary,
+  SimulatorSession,
+} from './types'
 
 type ThemePalette = 'default' | 'claude'
 const SIMULATOR_REPLY_DELAY_MS = 2000
 
 const samples = ref<SampleSummary[]>([])
+const datasets = ref<DatasetOption[]>([])
 const session = ref<SimulatorSession | null>(null)
 const loading = ref(false)
 const error = ref('')
@@ -52,7 +60,9 @@ function toggleTheme() {
 onMounted(async () => {
   loading.value = true
   try {
-    samples.value = await getSamples()
+    datasets.value = await getDatasets()
+    const dataset = datasets.value.find((item) => item.default)?.id ?? datasets.value[0]?.id
+    samples.value = dataset ? await getSamples(dataset) : []
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : 'Could not load public cases'
   } finally {
@@ -60,11 +70,23 @@ onMounted(async () => {
   }
 })
 
-async function start(sampleId: string) {
+async function changeDataset(dataset: string) {
   loading.value = true
   error.value = ''
   try {
-    session.value = await createSession(sampleId)
+    samples.value = await getSamples(dataset)
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : 'Could not load public cases'
+  } finally {
+    loading.value = false
+  }
+}
+
+async function start(sampleId: string, dataset: string, replyModel: ReplyModel) {
+  loading.value = true
+  error.value = ''
+  try {
+    session.value = await createSession(sampleId, dataset, replyModel)
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : 'Could not start session'
   } finally {
@@ -187,7 +209,13 @@ function reset() {
           :exit="{ opacity: 0, y: -8, scale: 0.99 }"
           :transition="{ duration: 0.24, ease: 'easeOut' }"
         >
-          <SessionSetup :samples="samples" :loading="loading" @start="start" />
+          <SessionSetup
+            :samples="samples"
+            :datasets="datasets"
+            :loading="loading"
+            @dataset-change="changeDataset"
+            @start="start"
+          />
         </motion.div>
 
         <motion.div

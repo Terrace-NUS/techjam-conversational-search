@@ -22,3 +22,5 @@ tests/test_organizer_pipeline.py
 node_modules/
 dist/
 data/thumbs/
+data/custom/
+data/custom_retry_B08ZKFD4GM

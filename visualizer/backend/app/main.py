@@ -14,13 +14,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from evaluator.local_evaluator import (
     MAX_TURNS,
     TOP_K,
-    TemplateReplyModel,
     catalog_index,
-    coarse_category,
     load_jsonl,
-    materialize_hidden_fields,
     normalize_recommendations,
 )
+from evaluator.reply_model import build_reply_model
+from evaluator.simulators import build_simulator
 
 
 AskAttribute = Literal[
@@ -41,6 +40,8 @@ class CreateSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sample_id: str = Field(min_length=1)
+    dataset: str | None = Field(default=None, min_length=1)
+    reply_model: Literal["template", "deepseek"] = "template"
 
 
 class AgentTurnRequest(BaseModel):
@@ -84,7 +85,17 @@ class SimulatorService:
                 if parent_asin in local_thumbs
                 else thumbnail_urls.get(parent_asin)
             )
-        self.samples = {sample["sample_id"]: sample for sample in load_jsonl(dataset_path)}
+        default_dataset = Path(dataset_path)
+        dataset_paths = {default_dataset, *default_dataset.parent.glob("public_set*.jsonl")}
+        self.datasets = {
+            path.stem: {
+                sample["sample_id"]: sample
+                for sample in load_jsonl(path)
+            }
+            for path in sorted(dataset_paths)
+            if path.is_file()
+        }
+        self.default_dataset = default_dataset.stem
         self.catalog_order = sorted(
             self.products,
             key=lambda parent_asin: (
@@ -134,14 +145,15 @@ class SimulatorService:
                 for field in ("price", "average_rating", "rating_number")
             },
         }
-        self.reply_model = TemplateReplyModel()
         self.sessions: dict[str, dict] = {}
         # ponytail: one lock is enough for a local visualizer; split per session if contention appears.
         self.lock = Lock()
 
     @staticmethod
     def sample_summary(sample: dict) -> dict:
-        return {field: sample.get(field) for field in SAMPLE_FIELDS}
+        summary = {field: sample.get(field) for field in SAMPLE_FIELDS}
+        summary["scenario_type"] = sample.get("scenario_type") or sample.get("intent")
+        return summary
 
     @staticmethod
     def product_summary(product: dict) -> dict:
@@ -200,11 +212,31 @@ class SimulatorService:
             total += min(scores)
         return total
 
-    def list_samples(self, scenario: str | None = None) -> list[dict]:
+    def list_datasets(self) -> list[dict]:
+        return [
+            {
+                "id": dataset_id,
+                "label": dataset_id.replace("_", " ").title(),
+                "sample_count": len(samples),
+                "default": dataset_id == self.default_dataset,
+            }
+            for dataset_id, samples in self.datasets.items()
+        ]
+
+    def list_samples(
+        self,
+        dataset_id: str | None = None,
+        scenario: str | None = None,
+    ) -> list[dict]:
+        dataset_id = dataset_id or self.default_dataset
+        samples = self.datasets.get(dataset_id)
+        if samples is None:
+            raise HTTPException(status_code=404, detail="dataset not found")
         return [
             self.sample_summary(sample)
-            for sample in self.samples.values()
-            if scenario is None or sample.get("scenario_type") == scenario
+            for sample in samples.values()
+            if scenario is None
+            or (sample.get("scenario_type") or sample.get("intent")) == scenario
         ]
 
     def search_catalog(
@@ -280,33 +312,40 @@ class SimulatorService:
             for _, _, parent_asin in sorted(matches)[offset : offset + limit]
         ]
 
-    def create_session(self, sample_id: str) -> dict:
-        sample = self.samples.get(sample_id)
+    def create_session(
+        self,
+        sample_id: str,
+        dataset_id: str,
+        reply_model_name: str,
+    ) -> dict:
+        samples = self.datasets.get(dataset_id)
+        if samples is None:
+            raise HTTPException(status_code=404, detail="dataset not found")
+        sample = samples.get(sample_id)
         if sample is None:
             raise HTTPException(status_code=404, detail="sample not found")
 
         target = str(sample["ground_truth"]["parent_asin"])
         if target not in self.products:
             raise RuntimeError(f"target product {target!r} is missing from the catalog")
-        intent_card, behavior = materialize_hidden_fields(sample, self.products)
-        effective_sample = {**sample, "intent_card": intent_card, "behavior": behavior}
-        disclosed: set[str] = set()
-        current_user_message = self.reply_model.initial_message(
-            effective_sample,
-            coarse_category(self.categories.get(target, [])),
-            disclosed,
-        )
         session_id = uuid4().hex
+        simulator = build_simulator(
+            sample,
+            self.categories,
+            self.products,
+            build_reply_model(reply_model_name),
+            session_id,
+        )
         session = {
             "id": session_id,
             "status": "waiting_for_agent",
-            "sample": effective_sample,
+            "sample": sample,
+            "dataset": dataset_id,
+            "reply_model": reply_model_name,
+            "simulator": simulator,
             "target": target,
-            "disclosed": disclosed,
-            "boundary_used": False,
-            "override_applied": sample["scenario_type"] != "intent_override",
             "current_turn": 1,
-            "current_user_message": current_user_message,
+            "current_user_message": simulator.initial_message(),
             "turns": [],
             "outcome": None,
         }
@@ -323,10 +362,11 @@ class SimulatorService:
                 raise HTTPException(status_code=409, detail="session has already ended")
 
             ranked = normalize_recommendations(request.recommendations, self.catalog_ids)
-            target = session["target"]
+            simulator = session["simulator"]
+            target = simulator.target
             hit_rank = (
                 ranked.index(target) + 1
-                if session["override_applied"] and target in ranked
+                if simulator.ready_for_hit and target in ranked
                 else None
             )
             turn = session["current_turn"]
@@ -351,20 +391,14 @@ class SimulatorService:
                 }
                 return self.session_view(session)
 
-            sample = session["sample"]
-            override = sample.get("behavior", {}).get("override") or {}
-            if not session["override_applied"] and turn + 1 == int(override.get("turn", 3)):
-                session["override_applied"] = True
-                if new_value := str(override.get("new_value", "")):
-                    session["disclosed"].add(new_value)
-                next_message = self.reply_model.override_message(override)
-            else:
-                next_message, session["boundary_used"] = self.reply_model.customer_reply(
-                    sample,
-                    request.ask_attribute,
-                    session["disclosed"],
-                    session["boundary_used"],
-                )
+            next_message = simulator.next_message(
+                {
+                    "message": request.message,
+                    "ask_attribute": request.ask_attribute,
+                    "recommendations": request.recommendations,
+                },
+                turn + 1,
+            )
             session["current_turn"] = turn + 1
             session["current_user_message"] = next_message
             return self.session_view(session)
@@ -380,6 +414,8 @@ class SimulatorService:
             "id": session["id"],
             "status": session["status"],
             "sample": self.sample_summary(session["sample"]),
+            "dataset": session["dataset"],
+            "reply_model": session["reply_model"],
             "user_profile": session["sample"]["user_profile"],
             "current_turn": session["current_turn"],
             "current_user_message": session["current_user_message"],
@@ -426,8 +462,12 @@ def create_app(
         return {"status": "ok"}
 
     @app.get("/api/samples")
-    def samples(scenario: str | None = None) -> list[dict]:
-        return simulator().list_samples(scenario)
+    def samples(dataset: str | None = None, scenario: str | None = None) -> list[dict]:
+        return simulator().list_samples(dataset, scenario)
+
+    @app.get("/api/datasets")
+    def datasets() -> list[dict]:
+        return simulator().list_datasets()
 
     @app.get("/api/catalog/search")
     def catalog_search(
@@ -459,7 +499,14 @@ def create_app(
 
     @app.post("/api/sessions", status_code=201)
     def create_session(request: CreateSessionRequest) -> dict:
-        return simulator().create_session(request.sample_id)
+        try:
+            return simulator().create_session(
+                request.sample_id,
+                request.dataset or simulator().default_dataset,
+                request.reply_model,
+            )
+        except (RuntimeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/api/sessions/{session_id}/turn")
     def submit_turn(session_id: str, request: AgentTurnRequest) -> dict:

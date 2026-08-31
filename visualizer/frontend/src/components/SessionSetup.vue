@@ -17,19 +17,23 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import type { SampleSummary } from '@/types'
+import type { DatasetOption, ReplyModel, SampleSummary } from '@/types'
 
 const props = defineProps<{
   samples: SampleSummary[]
+  datasets: DatasetOption[]
   loading: boolean
 }>()
 
 const emit = defineEmits<{
-  start: [sampleId: string]
+  start: [sampleId: string, dataset: string, replyModel: ReplyModel]
+  datasetChange: [dataset: string]
 }>()
 
 const scenario = ref('all')
 const selectedId = ref('')
+const dataset = ref('')
+const replyModel = ref<ReplyModel>('template')
 
 const scenarios = computed(() => [
   'all',
@@ -41,6 +45,20 @@ const filteredSamples = computed(() =>
     ? props.samples
     : props.samples.filter((sample) => sample.scenario_type === scenario.value),
 )
+
+watch(
+  () => props.datasets,
+  (datasets) => {
+    if (!datasets.some((item) => item.id === dataset.value)) {
+      dataset.value = datasets.find((item) => item.default)?.id ?? datasets[0]?.id ?? ''
+    }
+  },
+  { immediate: true },
+)
+
+watch(dataset, (value, previous) => {
+  if (value && previous) emit('datasetChange', value)
+})
 
 watch(
   filteredSamples,
@@ -68,6 +86,33 @@ watch(
     </CardHeader>
     <CardContent class="space-y-5">
       <div class="grid gap-4 sm:grid-cols-2">
+        <div class="grid gap-2 text-sm font-medium">
+          <label for="dataset-select">Dataset</label>
+          <Select v-model="dataset">
+            <SelectTrigger id="dataset-select" class="w-full">
+              <SelectValue placeholder="Choose a dataset" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem v-for="item in datasets" :key="item.id" :value="item.id">
+                {{ item.label }} · {{ item.sample_count }}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div class="grid gap-2 text-sm font-medium">
+          <label for="reply-model-select">Reply model</label>
+          <Select v-model="replyModel">
+            <SelectTrigger id="reply-model-select" class="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="template">Template</SelectItem>
+              <SelectItem value="deepseek">DeepSeek</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
         <div class="grid gap-2 text-sm font-medium">
           <label for="scenario-select">Scenario</label>
           <Select v-model="scenario">
@@ -108,8 +153,8 @@ watch(
       <Button
         class="w-full"
         size="lg"
-        :disabled="loading || !selectedId"
-        @click="emit('start', selectedId)"
+        :disabled="loading || !selectedId || !dataset"
+        @click="emit('start', selectedId, dataset, replyModel)"
       >
         <Play class="size-4" />
         {{ loading ? 'Starting…' : 'Start session' }}

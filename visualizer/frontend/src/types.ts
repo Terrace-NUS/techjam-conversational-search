@@ -20,6 +20,15 @@ export interface SampleSummary {
   category_bucket: string
 }
 
+export interface DatasetOption {
+  id: string
+  label: string
+  sample_count: number
+  default: boolean
+}
+
+export type ReplyModel = 'template' | 'deepseek'
+
 export interface ProductSummary {
   parent_asin: string
   title: string
@@ -86,6 +95,8 @@ export interface SessionOutcome {
 export interface SimulatorSession {
   id: string
   status: 'waiting_for_agent' | 'hit' | 'exhausted'
+  dataset: string
+  reply_model: ReplyModel
   sample: SampleSummary
   user_profile: UserProfile
   current_turn: number

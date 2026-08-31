@@ -42,7 +42,11 @@ COLORS = (
 )
 SIZE_WORDS = (
     "plus size", "one size", "extra small", "extra large", "x-small", "x-large",
-    "xxl", "xl", "large", "medium", "small", "wide", "narrow", "petite", "tall",
+    # Numeric and repeated-X codes are how real size charts spell the tail of the
+    # range ("XL-5XL"); without them the lookbehind in _word_pattern lets only the
+    # bare "XL" through and an eight-size chart collapses to a single size.
+    "xxxl", "xxl", "xs", "xl", "2xl", "3xl", "4xl", "5xl", "6xl",
+    "large", "medium", "small", "wide", "narrow", "petite", "tall",
 )
 STYLE_WORDS = (
     "casual", "formal", "vintage", "classic", "modern", "slim fit", "regular fit",

@@ -67,6 +67,14 @@ Open `http://localhost:5173`. Choose a public case, write the Agent message and
 `ask_attribute`, then search and rank up to ten catalog products. The hidden
 target is only revealed after a hit or turn 10.
 
+`--dataset` accepts both formats. Records with `"version":"v2"` use the
+embedded intent descriptions and modification fields; records without it keep
+the legacy simulator behavior. For the generated v2 development set, run:
+
+```bash
+uv run python -m evaluator.local_evaluator --dataset data/custom/public_set_v2.jsonl --progress
+```
+
 Agent implementations are selected with `--agent baseline|v1` (or
 `TECHJAM_AGENT`). `baseline` is the original BM25 starter; `v1` is the
 offline structured-retrieval implementation in `starter/v1/`.
@@ -146,12 +154,14 @@ Teams may use any legally accessible LLM API or local model. Teams manage their 
 
 ```text
 data/public_set.jsonl             200 labeled development sessions
+data/custom/public_set_v2.jsonl   v2 sessions with embedded intent data
 docs/competition_specification.md participant rules and evaluation protocol
 docs/agent_api_contract.json      machine-readable Agent contract
 docs/evaluation_config.json       scoring configuration
 docs/baseline_results.json        reproducible weak-starter reference score
 starter/agent.py                  editable weak starter
-evaluator/local_evaluator.py      public-set simulator and scorer
+evaluator/local_evaluator.py      public-set evaluator and scorer
+evaluator/simulators/             versioned simulator implementations
 ```
 
 ## Judging and Submission Policy

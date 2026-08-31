@@ -6,14 +6,18 @@ import json
 import tempfile
 
 from evaluator.local_evaluator import (
-    DeepSeekReplyModel,
-    TemplateReplyModel,
-    build_reply_model,
     catalog_index,
     evaluate,
+    load_jsonl,
     metric_summary,
     normalize_recommendations,
 )
+from evaluator.reply_model import (
+    DeepSeekReplyModel,
+    TemplateReplyModel,
+    build_reply_model,
+)
+from evaluator.simulators import Simulator, V1Simulator, V2Simulator
 from starter.agent import Agent, build_agent
 from starter.baseline import BaselineAgent
 from starter.v1 import V1Agent
@@ -30,7 +34,32 @@ class EchoTargetAgent:
         return {"message": "ok", "ask_attribute": None, "recommendations": [{"parent_asin": asin}]}
 
 
+class ModificationAgent:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def reset(self, session_id: str, user_profile: dict) -> None:
+        pass
+
+    def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
+        self.messages.append(user_message)
+        recommendations = [{"parent_asin": "A"}] if "Correction" in user_message else []
+        return {
+            "message": "ok",
+            "ask_attribute": "style",
+            "recommendations": recommendations,
+        }
+
+
 class EvaluatorTest(unittest.TestCase):
+    def test_versioned_simulators_implement_abc(self) -> None:
+        self.assertTrue(issubclass(V1Simulator, Simulator))
+        self.assertTrue(issubclass(V2Simulator, Simulator))
+
+    def test_unknown_dataset_version_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported dataset version"):
+            evaluate(EchoTargetAgent(), [{"version": "v3"}], set(), {}, {})
+
     def test_agent_factory_uses_abc_implementations(self) -> None:
         self.assertTrue(issubclass(BaselineAgent, Agent))
         self.assertTrue(issubclass(V1Agent, Agent))
@@ -152,6 +181,150 @@ class EvaluatorTest(unittest.TestCase):
             }]
             result = evaluate(EchoTargetAgent(), samples, catalog_ids, categories, products)
             self.assertEqual(result["hit_rate_at_10"], 1.0)
+            self.assertEqual(result["sessions"][0]["scenario_type"], "buying")
+            self.assertNotIn("override", result["sessions"][0])
+
+    def test_legacy_public_set_is_not_implicitly_upgraded(self) -> None:
+        sample = {
+            "sample_id": "legacy_override",
+            "scenario_type": "intent_override",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "public_set.jsonl"
+            path.write_text(json.dumps(sample) + "\n", encoding="utf-8")
+            self.assertEqual(load_jsonl(path), [sample])
+
+    def test_custom_override_uses_fake_then_correction_at_modify_turn(self) -> None:
+        catalog_ids = {"A"}
+        categories = {"A": ["Clothing", "Shirts"]}
+        products = {"A": {"parent_asin": "A"}}
+        sample = {
+            "version": "v2",
+            "sample_id": "override_1",
+            "intent": "buying",
+            "override": True,
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+            "item_id": "A",
+            "features": products["A"],
+            "intent_descriptions": {
+                "browsing": {"style": "browsing true", "material": "cotton", "size": "medium", "color": "blue"},
+                "buying": {"style": "buying true", "material": "cotton", "size": "medium", "color": "blue"},
+            },
+            "fake_attributes": {"style": {"browsing": "fake style", "buying": "fake style"}},
+            "correction_messages": {"style": {"browsing": "Correction: true style", "buying": "Correction: true style"}},
+            "modify_turn": 3,
+        }
+        agent = ModificationAgent()
+        result = evaluate(agent, [sample], catalog_ids, categories, products)
+        self.assertEqual(result["hit_rate_at_10"], 1.0)
+        self.assertEqual(result["sessions"][0]["version"], "v2")
+        self.assertIn("fake style", agent.messages)
+        self.assertTrue(any("Correction: true style" in message for message in agent.messages))
+
+    def test_v2_without_modification_uses_embedded_item(self) -> None:
+        product = {"parent_asin": "A"}
+        sample = {
+            "version": "v2",
+            "sample_id": "browse_1",
+            "intent": "browsing",
+            "override": False,
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+            "item_id": "A",
+            "features": product,
+            "intent_descriptions": {
+                intent: {"style": "classic", "material": "cotton", "size": "medium", "color": "blue"}
+                for intent in ("browsing", "buying")
+            },
+            "fake_attributes": {},
+            "correction_messages": {},
+            "modify_turn": None,
+        }
+        result = evaluate(EchoTargetAgent(), [sample], {"A"}, {"A": []}, {"A": product})
+        self.assertEqual(result["hit_rate_at_10"], 1.0)
+        self.assertEqual(result["override_metrics"]["sample_count"], 0)
+
+    def test_v2_initial_message_reads_current_intent_descriptions_directly(self) -> None:
+        product = {"parent_asin": "A"}
+        sample = {
+            "version": "v2",
+            "sample_id": "buy_1",
+            "intent": "buying",
+            "override": False,
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+            "item_id": "A",
+            "features": product,
+            "intent_descriptions": {
+                "browsing": {
+                    "style": "relaxed",
+                    "material": "natural fabric",
+                    "size": "several sizes",
+                    "category": "shirts",
+                },
+                "buying": {
+                    "style": "classic",
+                    "material": "cotton",
+                    "size": "medium",
+                    "category": "fitted shirts",
+                },
+            },
+            "fake_attributes": {},
+            "correction_messages": {},
+            "modify_turn": None,
+        }
+        simulator = V2Simulator(
+            sample,
+            {"A": ["Clothing", "Shirts"]},
+            {"A": product},
+            TemplateReplyModel(),
+            "session",
+        )
+        self.assertFalse(hasattr(simulator, "intent_card"))
+        self.assertIn(
+            simulator.initial_message(),
+            {
+                "I'm looking for fitted shirts. A key requirement is: classic.",
+                "I'm looking for fitted shirts. A key requirement is: cotton.",
+                "I'm looking for fitted shirts. A key requirement is: medium.",
+            },
+        )
+
+    def test_mixed_dataset_switches_logic_per_record(self) -> None:
+        product = {"parent_asin": "A"}
+        legacy = {
+            "sample_id": "legacy_1",
+            "scenario_type": "boundary",
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+        }
+        v2 = {
+            "version": "v2",
+            "sample_id": "v2_1",
+            "intent": "browsing",
+            "override": False,
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+            "item_id": "A",
+            "features": product,
+            "intent_descriptions": {
+                intent: {"style": "classic", "material": "cotton", "size": "medium", "color": "blue"}
+                for intent in ("browsing", "buying")
+            },
+            "fake_attributes": {},
+            "correction_messages": {},
+            "modify_turn": None,
+        }
+        result = evaluate(
+            EchoTargetAgent(), [legacy, v2], {"A"}, {"A": []}, {"A": product}
+        )
+        self.assertEqual(
+            [session["scenario_type"] for session in result["sessions"]],
+            ["boundary", "browsing"],
+        )
+        self.assertNotIn("version", result["sessions"][0])
+        self.assertEqual(result["sessions"][1]["version"], "v2")
 
 
 if __name__ == "__main__":
