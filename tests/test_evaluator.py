@@ -245,7 +245,7 @@ class EvaluatorTest(unittest.TestCase):
         self.assertEqual(result["hit_rate_at_10"], 1.0)
         self.assertEqual(result["override_metrics"]["sample_count"], 0)
 
-    def test_v2_initial_message_reads_current_intent_descriptions_directly(self) -> None:
+    def test_v2_initial_message_reads_current_intent_category_directly(self) -> None:
         product = {"parent_asin": "A"}
         sample = {
             "version": "v2",
@@ -282,13 +282,9 @@ class EvaluatorTest(unittest.TestCase):
             "session",
         )
         self.assertFalse(hasattr(simulator, "intent_card"))
-        self.assertIn(
+        self.assertEqual(
             simulator.initial_message(),
-            {
-                "I'm looking for fitted shirts. A key requirement is: classic.",
-                "I'm looking for fitted shirts. A key requirement is: cotton.",
-                "I'm looking for fitted shirts. A key requirement is: medium.",
-            },
+            "I'm looking for fitted shirts.",
         )
 
     def test_mixed_dataset_switches_logic_per_record(self) -> None:
