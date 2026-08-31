@@ -21,10 +21,10 @@ from evaluator.local_evaluator import (
 )
 from evaluator.reply_model import ReplyModel, build_reply_model
 from evaluator.simulators import build_simulator
-from evaluator.simulators.v1 import searchable_text
 from starter.agent import Agent, build_agent
 from scripts.intent_manager import IntentManager
 from scripts.reward_calculator import GeminiEmbeddingClient, RewardCalculator
+from scripts.structured_text import structured_product_text
 
 
 AskAttribute = Literal[
@@ -232,7 +232,7 @@ class SimulatorService:
                 if self.reward_calculator is None:
                     self.reward_calculator = RewardCalculator(
                         GeminiEmbeddingClient(),
-                        text_fn=searchable_text,
+                        text_fn=structured_product_text,
                     )
                 scores[parent_asin] = self.reward_calculator.score_turn(
                     [parent_asin],

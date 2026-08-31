@@ -21,6 +21,7 @@ from evaluator.simulators import Simulator, V1Simulator, V2Simulator
 from starter.agent import Agent, build_agent
 from starter.baseline import BaselineAgent
 from starter.v1 import V1Agent
+from scripts.structured_text import structured_product_text
 
 
 class EchoTargetAgent:
@@ -83,6 +84,37 @@ class FixedRewardCalculator:
 
 
 class EvaluatorTest(unittest.TestCase):
+    def test_structured_product_text_filters_noise(self) -> None:
+        text = structured_product_text({
+            "title": "Premium Cotton Shirt",
+            "store": "Acme",
+            "categories": ["Clothing", "Shirts", "Shirts"],
+            "features": ["100% Cotton", "Machine Wash", "100% Cotton"],
+            "details": {
+                "Material": "Cotton",
+                "Color": "Blue",
+                "Item model number": "XYZ-1",
+            },
+            "description": ["Best Seller! " + ("Long marketing copy. " * 100)],
+            "price": 24.5,
+        })
+        self.assertIn("TITLE: premium cotton shirt", text)
+        self.assertIn("BRAND: acme", text)
+        self.assertIn("CATEGORY: clothing | shirts", text)
+        self.assertIn("ATTRIBUTES: material: cotton | color: blue", text)
+        self.assertNotIn("item model number", text)
+        self.assertNotIn("best seller", text)
+
+    def test_structured_product_text_omits_empty_and_duplicate_values(self) -> None:
+        text = structured_product_text({
+            "title": "  Shirt  ",
+            "categories": ["Shirts", "shirts", ""],
+            "features": [],
+            "details": {},
+            "description": [],
+        })
+        self.assertEqual(text, "TITLE: shirt\nCATEGORY: shirts")
+
     def test_versioned_simulators_implement_abc(self) -> None:
         self.assertTrue(issubclass(V1Simulator, Simulator))
         self.assertTrue(issubclass(V2Simulator, Simulator))
