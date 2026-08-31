@@ -1,24 +1,21 @@
 from __future__ import annotations
 
-import random
 from dataclasses import dataclass, field
 
 from .schema import Item
 from .schema import Modification
 
-ACTIVE_ATTRIBUTE_COUNT = 4
 INTENTS = ("browsing", "buying")
 
 
 @dataclass
 class QueryHandler:
-    """Serve only the session's selected attributes from the current intent."""
+    """Serve every available attribute from the current intent."""
 
     session_id: str
     item: Item
     intent: str = "browsing"
     modification: Modification | None = None
-    preferred_attributes: tuple[str, ...] = ()
     active_attributes: tuple[str, ...] = field(init=False)
     disclosed_attributes: set[str] = field(default_factory=set, init=False)
     modification_applied: bool = field(default=False, init=False)
@@ -26,20 +23,10 @@ class QueryHandler:
     def __post_init__(self) -> None:
         if self.intent not in INTENTS:
             raise ValueError(f"unknown intent: {self.intent}")
-        available = sorted(
+        self.active_attributes = tuple(sorted(
             set(self.item.intent_descriptions.get("browsing", {}))
             | set(self.item.intent_descriptions.get("buying", {}))
-        )
-        rng = random.Random(f"{self.session_id}:{self.item.item_id}:active_attributes")
-        if len(available) < ACTIVE_ATTRIBUTE_COUNT:
-            raise ValueError(
-                f"item {self.item.item_id} has {len(available)} attributes; "
-                f"exactly {ACTIVE_ATTRIBUTE_COUNT} are required"
-            )
-        preferred = [name for name in self.preferred_attributes if name in available]
-        remaining = [name for name in available if name not in preferred]
-        selected = preferred + rng.sample(remaining, k=ACTIVE_ATTRIBUTE_COUNT - len(preferred))
-        self.active_attributes = tuple(selected)
+        ))
 
     def _modification_attribute(self) -> str | None:
         if not self.modification or not self.modification.fake_attributes:
@@ -63,10 +50,10 @@ class QueryHandler:
         return self.modification.correction_messages.get(attribute, {}).get(self.intent, "")
 
     def answer(self, ask_attribute: object, turn: int = 1) -> str | None:
-        """Return the current-intent clue for an active attribute and mark it disclosed.
+        """Return the current-intent clue for an available attribute and mark it disclosed.
 
-        A direct request for an inactive attribute is intentionally unanswered. The
-        ``other`` attribute is handled like every other active attribute.
+        An unknown attribute is unanswered. ``other`` is handled like every other
+        available attribute.
         """
         correction = self._apply_modification(turn)
         attribute = ask_attribute if isinstance(ask_attribute, str) else None

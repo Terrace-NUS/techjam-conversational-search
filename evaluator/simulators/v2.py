@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import random
-
 from evaluator.reply_model import ReplyModel
 from scripts.schema import Item, Modification
 from scripts.session import create_session
@@ -65,25 +63,14 @@ class V2Simulator(Simulator):
         fallback_category = coarse_category(categories.get(self.target, []))
         self.descriptions = item.intent_descriptions.get(self.intent, {})
         self.category = str(self.descriptions.get("category") or fallback_category)
-        constraints = [
-            str(value)
-            for attribute, value in self.descriptions.items()
-            if attribute != "category" and value not in (None, "")
-        ]
-        rng = random.Random(
-            f"{sample['sample_id']}:{item.item_id}:{self.intent}:initial_constraint"
-        )
-        self.initial_constraint = rng.choice(constraints) if constraints else None
         self.query_handler = create_session(
             str(sample["sample_id"]), item, self.modification, initial_intent=self.intent
         ).query_handler
         self.override_applied = not self.override
 
     def initial_message(self) -> str:
-        if self.intent == "buying" and self.initial_constraint:
-            canonical = (
-                f"I'm looking for {self.category}. "
-            )
+        if self.intent == "buying":
+            canonical = f"I'm looking for {self.category}."
         else:
             canonical = f"I'm looking for {self.category}, but I'm still exploring."
         return self.reply_model.rewrite_initial_message(canonical)
