@@ -21,18 +21,12 @@ def create_session(
     modification: Modification | None = None,
     initial_intent: str = "browsing",
 ) -> Session:
-    """Select attributes and enable the supplied modification."""
+    """Create a query handler and enable the supplied modification."""
     enabled_modification = modification
-    preferred = (
-        (next(iter(enabled_modification.fake_attributes)),)
-        if enabled_modification and enabled_modification.fake_attributes
-        else ()
-    )
     handler = QueryHandler(
         session_id,
         item,
         initial_intent,
         enabled_modification,
-        preferred,
     )
     return Session(session_id, item, handler, enabled_modification)
