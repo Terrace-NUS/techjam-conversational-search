@@ -106,7 +106,7 @@ class GeminiEmbeddingClientTest(unittest.TestCase):
     def test_embed_caches_to_disk_and_skips_repeat_requests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cache_dir = Path(directory)
-            client = GeminiEmbeddingClient(api_key="test-key", cache_dir=cache_dir)
+            client = GeminiEmbeddingClient(api_key="test-key", cache_dir=cache_dir, output_dimensionality=2)
             with mock.patch.object(client, "_request", return_value=[0.1, 0.2]) as request:
                 first = client.embed("A", "target product")
                 second = client.embed("A", "target product")
@@ -117,9 +117,26 @@ class GeminiEmbeddingClientTest(unittest.TestCase):
                 json.loads((cache_dir / "A.json").read_text(encoding="utf-8")),
                 {
                     "model": client.model,
+                    "dimensions": 2,
+                    "task_type": client.TASK_TYPE,
                     "text_hash": hashlib.sha256("target product".encode("utf-8")).hexdigest(),
                     "values": [0.1, 0.2],
                 },
+            )
+
+    def test_embed_truncates_before_request_and_cache_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = GeminiEmbeddingClient(
+                api_key="test-key", cache_dir=directory, output_dimensionality=2
+            )
+            text = "x" * (client.MAX_INPUT_CHARS + 10)
+            expected = text[: client.MAX_INPUT_CHARS]
+            with mock.patch.object(client, "_request", return_value=[0.1, 0.2]) as request:
+                client.embed("A", text)
+            request.assert_called_once_with(expected)
+            payload = json.loads((Path(directory) / "A.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["text_hash"], hashlib.sha256(expected.encode("utf-8")).hexdigest()
             )
 
 

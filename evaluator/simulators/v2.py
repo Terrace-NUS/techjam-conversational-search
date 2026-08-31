@@ -2,10 +2,24 @@ from __future__ import annotations
 
 from evaluator.reply_model import ReplyModel
 from scripts.intent_manager import VALID_INTENTS
+from scripts.query_attribute import extract_attribute
+from scripts.query_handler import QueryHandler
 from scripts.schema import Item, Modification, clue_text
 from scripts.session import create_session
 
 from .base import Simulator, coarse_category
+
+
+def query_attribute_from_response(
+    response: dict, query_handler: QueryHandler
+) -> str | None:
+    """Prefer the natural-language question, then fall back to ask_attribute."""
+    available = query_handler.item.intent_descriptions.get(query_handler.intent, {})
+    attribute = extract_attribute(response.get("message"))
+    if attribute is not None:
+        return attribute if attribute in available else None
+    fallback = response.get("ask_attribute")
+    return fallback if isinstance(fallback, str) and fallback in available else None
 
 
 class V2Simulator(Simulator):
@@ -84,8 +98,12 @@ class V2Simulator(Simulator):
     def ready_for_hit(self) -> bool:
         return True
 
+    def query_attribute(self, response: dict) -> str | None:
+        return query_attribute_from_response(response, self.query_handler)
+
     def next_message(self, response: dict, next_turn: int) -> str:
-        canonical = self.query_handler.answer(response.get("ask_attribute"), next_turn)
+        attribute = self.query_attribute(response)
+        canonical = self.query_handler.answer(attribute, next_turn)
         canonical = canonical or "I don't have an additional preference for that."
         return self.reply_model.rewrite_query_answer(canonical)
 

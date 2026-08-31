@@ -43,6 +43,10 @@ class Simulator(ABC):
     def ready_for_hit(self) -> bool:
         raise NotImplementedError
 
+    def query_attribute(self, response: dict) -> str | None:
+        attribute = response.get("ask_attribute")
+        return attribute if isinstance(attribute, str) else None
+
     @abstractmethod
     def next_message(self, response: dict, next_turn: int) -> str:
         raise NotImplementedError

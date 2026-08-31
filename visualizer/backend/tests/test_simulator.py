@@ -137,12 +137,17 @@ class VisualizerApiTest(unittest.TestCase):
                 client.post(f"/api/sessions/{debug_view['id']}/initialize")
                 debug_view = client.post(
                     f"/api/sessions/{debug_view['id']}/turn",
-                    json={"message": "Try this.", "recommendations": ["TARGET"]},
+                    json={
+                        "message": "Try this.",
+                        "ask_attribute": "color",
+                        "recommendations": ["TARGET"],
+                    },
                 ).json()
                 self.assertEqual(
                     debug_view["turns"][0]["recommendation_scores"],
                     {"TARGET": 1.0},
                 )
+                self.assertEqual(debug_view["turns"][0]["queried_attribute"], "color")
 
                 human_view = client.post(
                     "/api/human-sessions",
@@ -221,6 +226,7 @@ class VisualizerApiTest(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 view = response.json()
                 self.assertEqual(view["turns"][0]["agent_message"], "")
+                self.assertIsNone(view["turns"][0]["queried_attribute"])
                 self.assertEqual(
                     view["current_user_message"],
                     "I don't have a preference for color; please use your judgment.",

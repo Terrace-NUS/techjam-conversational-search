@@ -18,10 +18,15 @@ from evaluator.reply_model import (
     build_reply_model,
 )
 from evaluator.simulators import Simulator, V1Simulator, V2Simulator
+from evaluator.simulators.v2 import query_attribute_from_response
 from starter.agent import Agent, build_agent
 from starter.baseline import BaselineAgent
 from starter.v1 import V1Agent
+from starter.terrace import TerraceAgent
 from scripts.structured_text import structured_product_text
+from scripts import query_attribute as query_attribute_module
+from scripts.query_handler import QueryHandler
+from scripts.schema import Item
 
 
 class EchoTargetAgent:
@@ -83,7 +88,60 @@ class FixedRewardCalculator:
         return self.subscore
 
 
+class FakeAttributeExtractor:
+    def __init__(self, mapping: dict[str, str | None]) -> None:
+        self.mapping = mapping
+
+    def extract(self, query: str, candidates: tuple[str, ...]) -> str | None:
+        return self.mapping.get(query)
+
+
 class EvaluatorTest(unittest.TestCase):
+    def test_natural_language_attribute_precedes_structured_fallback(self) -> None:
+        item = Item(
+            "A",
+            {},
+            {"browsing": {"material": "material clue", "color": "color clue"}},
+        )
+        handler = QueryHandler("natural-query", item)
+        query_attribute_module.set_default_extractor(
+            FakeAttributeExtractor({"What fabric do you prefer?": "material"})
+        )
+        self.addCleanup(query_attribute_module.set_default_extractor, None)
+
+        attribute = query_attribute_from_response(
+            {"message": "What fabric do you prefer?", "ask_attribute": "color"},
+            handler,
+        )
+
+        self.assertEqual(attribute, "material")
+
+    def test_structured_attribute_is_used_when_message_has_no_match(self) -> None:
+        item = Item("A", {}, {"browsing": {"material": "material clue"}})
+        handler = QueryHandler("fallback-query", item)
+        query_attribute_module.set_default_extractor(FakeAttributeExtractor({}))
+        self.addCleanup(query_attribute_module.set_default_extractor, None)
+
+        attribute = query_attribute_from_response(
+            {"message": "Thanks.", "ask_attribute": "material"}, handler
+        )
+
+        self.assertEqual(attribute, "material")
+
+    def test_natural_language_attribute_missing_from_item_returns_none(self) -> None:
+        item = Item("A", {}, {"browsing": {"feature": "rear pocket"}})
+        handler = QueryHandler("missing-color", item)
+        query_attribute_module.set_default_extractor(
+            FakeAttributeExtractor({"What's the color?": "color"})
+        )
+        self.addCleanup(query_attribute_module.set_default_extractor, None)
+
+        attribute = query_attribute_from_response(
+            {"message": "What's the color?", "ask_attribute": "feature"}, handler
+        )
+
+        self.assertIsNone(attribute)
+
     def test_structured_product_text_filters_noise(self) -> None:
         text = structured_product_text({
             "title": "Premium Cotton Shirt",
@@ -126,6 +184,7 @@ class EvaluatorTest(unittest.TestCase):
     def test_agent_factory_uses_abc_implementations(self) -> None:
         self.assertTrue(issubclass(BaselineAgent, Agent))
         self.assertTrue(issubclass(V1Agent, Agent))
+        self.assertTrue(issubclass(TerraceAgent, Agent))
         with tempfile.TemporaryDirectory() as directory:
             catalog = Path(directory) / "catalog.jsonl"
             catalog.write_text(json.dumps({"parent_asin": "A"}) + "\n", encoding="utf-8")

@@ -721,19 +721,31 @@ class SimulatorService:
                 ranked,
                 update_intent=hit_rank is None and turn < MAX_TURNS,
             )
+            simulator_response = {
+                "message": request.message,
+                "ask_attribute": request.ask_attribute,
+                "recommendations": request.recommendations,
+            }
+            terminal = hit_rank is not None or turn == MAX_TURNS
+            queried_attribute = (
+                simulator.query_attribute(simulator_response)
+                if session["debug"] or not terminal
+                else None
+            )
             session["turns"].append(
                 {
                     "user_message": session["current_user_message"],
                     "user_message_original": session["current_user_message_original"],
                     "agent_message": request.message,
                     "ask_attribute": request.ask_attribute,
+                    "queried_attribute": queried_attribute,
                     "recommendations": ranked,
                     "hit_rank": hit_rank,
                     **metrics,
                 }
             )
 
-            if hit_rank is not None or turn == MAX_TURNS:
+            if terminal:
                 session["status"] = "hit" if hit_rank is not None else "exhausted"
                 session["current_user_message"] = None
                 session["current_user_message_original"] = None
@@ -746,11 +758,7 @@ class SimulatorService:
                 return self.session_view(session)
 
             next_message = simulator.next_message(
-                {
-                    "message": request.message,
-                    "ask_attribute": request.ask_attribute,
-                    "recommendations": request.recommendations,
-                },
+                {**simulator_response, "message": "", "ask_attribute": queried_attribute},
                 turn + 1,
             )
             session["current_turn"] = turn + 1
@@ -795,6 +803,9 @@ class SimulatorService:
             "turns": [
                 {
                     **turn,
+                    "queried_attribute": (
+                        turn["queried_attribute"] if session["debug"] else None
+                    ),
                     "user_message_original": (
                         turn["user_message_original"]
                         if session["debug"] and session["reply_model"] == "deepseek"

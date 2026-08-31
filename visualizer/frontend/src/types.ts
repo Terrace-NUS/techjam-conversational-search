@@ -13,6 +13,19 @@ export const ASK_ATTRIBUTES = [
 
 export type AskAttribute = (typeof ASK_ATTRIBUTES)[number]
 
+export const ATTRIBUTE_QUESTIONS: Record<AskAttribute, string> = {
+  category: 'What kind of product are you looking for?',
+  material: 'Do you have a material preference?',
+  color: 'Do you have a color preference?',
+  size: 'Are there any sizing or fit requirements?',
+  style: 'What style or fit do you prefer?',
+  brand: 'Do you have a preferred brand?',
+  budget: 'What budget range should I use?',
+  feature: 'Which product features matter most to you?',
+  use_case: 'What will you mainly use it for?',
+  other: 'What other details matter most to you?',
+}
+
 export interface SampleSummary {
   sample_id: string
   scenario_type: string
@@ -95,6 +108,7 @@ export interface TurnRecord {
   user_message_original: string | null
   agent_message: string
   ask_attribute: AskAttribute | null
+  queried_attribute?: AskAttribute | null
   recommendations: ProductSummary[]
   hit_rank: number | null
   subscore: number | null

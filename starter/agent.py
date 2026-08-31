@@ -27,6 +27,10 @@ def build_agent(name: str | None = None, catalog_path: str | Path = "data/catalo
         from .v1 import V1Agent
 
         return V1Agent(catalog_path)
+    if mode in {"terrace", "shopping_copilot", "real_world"}:
+        from .terrace import TerraceAgent
+
+        return TerraceAgent(catalog_path)
     raise ValueError(f"unknown agent: {mode}")
 
 

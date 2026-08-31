@@ -66,7 +66,8 @@ class GeminiEmbeddingClient:
     DEFAULT_MODEL = "gemini-embedding-001"
     DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com"
     TASK_TYPE = "SEMANTIC_SIMILARITY"
-    MAX_INPUT_CHARS = 20000
+    DEFAULT_OUTPUT_DIMENSIONALITY = 768
+    MAX_INPUT_CHARS = 1000
 
     def __init__(
         self,
@@ -75,45 +76,79 @@ class GeminiEmbeddingClient:
         base_url: str | None = None,
         cache_dir: str | Path = "data/cache/embeddings",
         timeout: float = 30.0,
+        output_dimensionality: int | None = None,
     ) -> None:
         _load_dotenv()
-        self.api_key = api_key or os.environ.get("GEMINI_API_KEY", "").strip()
+        self.api_key = (
+            api_key
+            or os.environ.get("AI_STUIDIO_API_KEY", "").strip()
+            or os.environ.get("AI_STUDIO_API_KEY", "").strip()
+            or os.environ.get("GEMINI_API_KEY", "").strip()
+        )
         if not self.api_key:
             raise RuntimeError(
-                "GEMINI_API_KEY is required for embedding-based reward scoring; "
-                "set it in the environment or a .env file."
+                "GEMINI_API_KEY or AI_STUIDIO_API_KEY is required for embedding-based "
+                "reward scoring; set it in the environment or a .env file."
             )
         self.model = model or os.environ.get("GEMINI_EMBEDDING_MODEL", self.DEFAULT_MODEL)
         self.base_url = (base_url or os.environ.get("GEMINI_BASE_URL", self.DEFAULT_BASE_URL)).rstrip("/")
+        self.output_dimensionality = output_dimensionality or int(
+            os.environ.get("GEMINI_EMBEDDING_DIMENSIONS", self.DEFAULT_OUTPUT_DIMENSIONALITY)
+        )
+        if self.output_dimensionality <= 0:
+            raise ValueError("output_dimensionality must be positive")
         self.cache_dir = Path(cache_dir)
         self.timeout = timeout
 
     def embed(self, asin: str, text: str) -> list[float]:
         """Return the embedding for `text`, invalidating stale ASIN caches."""
         cache_path = self.cache_dir / f"{asin}.json"
-        text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        if cache_path.is_file():
-            cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            if (
-                cached.get("model") == self.model
-                and cached.get("text_hash") == text_hash
-                and isinstance(cached.get("values"), list)
-            ):
-                return cached["values"]
-        values = self._request(text)
+        input_text = text[: self.MAX_INPUT_CHARS]
+        text_hash = hashlib.sha256(input_text.encode("utf-8")).hexdigest()
+        cached = self._cached_values(cache_path, text_hash)
+        if cached is not None:
+            return cached
+        values = self._request(input_text)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
-            json.dumps({"model": self.model, "text_hash": text_hash, "values": values}),
+        temporary_path = cache_path.with_suffix(".tmp")
+        temporary_path.write_text(
+            json.dumps(
+                {
+                    "model": self.model,
+                    "dimensions": self.output_dimensionality,
+                    "task_type": self.TASK_TYPE,
+                    "text_hash": text_hash,
+                    "values": values,
+                }
+            ),
             encoding="utf-8",
         )
+        temporary_path.replace(cache_path)
         return values
+
+    def _cached_values(self, cache_path: Path, text_hash: str) -> list[float] | None:
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if (
+            cached.get("model") == self.model
+            and cached.get("dimensions") == self.output_dimensionality
+            and cached.get("task_type") == self.TASK_TYPE
+            and cached.get("text_hash") == text_hash
+            and isinstance(cached.get("values"), list)
+            and len(cached["values"]) == self.output_dimensionality
+        ):
+            return cached["values"]
+        return None
 
     def _request(self, text: str) -> list[float]:
         url = f"{self.base_url}/v1beta/models/{self.model}:embedContent?key={self.api_key}"
         payload = {
             "model": f"models/{self.model}",
-            "content": {"parts": [{"text": text[: self.MAX_INPUT_CHARS]}]},
+            "content": {"parts": [{"text": text}]},
             "taskType": self.TASK_TYPE,
+            "outputDimensionality": self.output_dimensionality,
         }
         request = urllib.request.Request(
             url,
@@ -138,6 +173,7 @@ class SiliconFlowEmbeddingClient(GeminiEmbeddingClient):
 
     DEFAULT_MODEL = "Qwen/Qwen3-Embedding-0.6B"
     DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
+    MAX_INPUT_CHARS = 20000
 
     def __init__(
         self,
@@ -146,6 +182,7 @@ class SiliconFlowEmbeddingClient(GeminiEmbeddingClient):
         base_url: str | None = None,
         cache_dir: str | Path = "data/cache/embeddings",
         timeout: float = 30.0,
+        output_dimensionality: int | None = None,
     ) -> None:
         _load_dotenv()
         self.api_key = api_key or os.environ.get("SILICONFLOW_API_KEY", "").strip()
@@ -156,6 +193,11 @@ class SiliconFlowEmbeddingClient(GeminiEmbeddingClient):
             )
         self.model = model or os.environ.get("SILICONFLOW_EMBEDDING_MODEL", self.DEFAULT_MODEL)
         self.base_url = (base_url or os.environ.get("SILICONFLOW_BASE_URL", self.DEFAULT_BASE_URL)).rstrip("/")
+        self.output_dimensionality = output_dimensionality or int(
+            os.environ.get("SILICONFLOW_EMBEDDING_DIMENSIONS", 1024)
+        )
+        if self.output_dimensionality <= 0:
+            raise ValueError("output_dimensionality must be positive")
         self.cache_dir = Path(cache_dir)
         self.timeout = timeout
         from openai import OpenAI

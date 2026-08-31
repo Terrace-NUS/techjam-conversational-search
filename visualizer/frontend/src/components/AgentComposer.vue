@@ -21,15 +21,16 @@ const emit = defineEmits<{
 }>()
 
 const message = ref('')
-const askAttribute = ref<AskAttribute | 'none'>('none')
+const inputMode = ref<'message' | 'attribute'>('message')
+const askAttribute = ref<AskAttribute>('category')
 const recommendations = ref<ProductSummary[]>([])
 
 function submit() {
   emit(
     'submit',
     {
-      message: message.value,
-      ask_attribute: askAttribute.value === 'none' ? null : askAttribute.value,
+      message: inputMode.value === 'message' ? message.value : '',
+      ask_attribute: inputMode.value === 'attribute' ? askAttribute.value : null,
       recommendations: recommendations.value.map((product) => product.parent_asin),
     },
     [...recommendations.value],
@@ -38,7 +39,7 @@ function submit() {
 
 function clear() {
   message.value = ''
-  askAttribute.value = 'none'
+  askAttribute.value = 'category'
   recommendations.value = []
 }
 
@@ -51,8 +52,29 @@ defineExpose({ clear })
       <CardTitle class="text-base">Compose Agent response</CardTitle>
     </CardHeader>
     <CardContent class="space-y-5">
-      <label class="grid gap-2 text-sm font-medium">
-        Message <span class="font-normal text-muted-foreground">(optional)</span>
+      <div class="grid grid-cols-2 rounded-md border p-1" role="group" aria-label="Query input mode">
+        <button
+          type="button"
+          :aria-pressed="inputMode === 'message'"
+          :class="['h-9 rounded-sm px-3 text-sm font-medium transition-colors', inputMode === 'message' ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted']"
+          :disabled="loading"
+          @click="inputMode = 'message'"
+        >
+          Message
+        </button>
+        <button
+          type="button"
+          :aria-pressed="inputMode === 'attribute'"
+          :class="['h-9 rounded-sm px-3 text-sm font-medium transition-colors', inputMode === 'attribute' ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted']"
+          :disabled="loading"
+          @click="inputMode = 'attribute'"
+        >
+          Attribute
+        </button>
+      </div>
+
+      <label v-if="inputMode === 'message'" class="grid gap-2 text-sm font-medium">
+        Message
         <Textarea
           v-model="message"
           rows="3"
@@ -61,14 +83,13 @@ defineExpose({ clear })
         />
       </label>
 
-      <div class="grid gap-2 text-sm font-medium">
+      <div v-else class="grid gap-2 text-sm font-medium">
         <label for="ask-attribute-select">Ask attribute</label>
         <Select v-model="askAttribute" :disabled="loading">
           <SelectTrigger id="ask-attribute-select" class="w-full">
             <SelectValue placeholder="Choose an attribute" />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="none">None</SelectItem>
             <SelectItem v-for="attribute in ASK_ATTRIBUTES" :key="attribute" :value="attribute">
               {{ attribute.replaceAll('_', ' ') }}
             </SelectItem>
