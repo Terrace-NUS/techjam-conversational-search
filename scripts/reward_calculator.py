@@ -171,20 +171,18 @@ class SiliconFlowEmbeddingClient(GeminiEmbeddingClient):
 
 
 class RewardCalculator:
-    """Per-turn subscore: rank-1 recommendation relevance to the session's ground truth."""
+    """Per-turn subscore: maximum recommendation relevance to the ground truth."""
 
     def __init__(
         self,
         embedding_client: GeminiEmbeddingClient,
         text_fn: Callable[[dict], str],
         baseline_sample_size: int = 32,
-        margin_scale: float = 10.0,
         baseline_cache_path: str | Path = "data/cache/baselines.json",
     ) -> None:
         self.embedding_client = embedding_client
         self.text_fn = text_fn
         self.baseline_sample_size = max(0, baseline_sample_size)
-        self.margin_scale = max(0.0, margin_scale)
         self.baseline_cache_path = Path(baseline_cache_path)
         self._baseline_cache: dict[str, float] = {}
         self._baseline_lock = threading.Lock()
@@ -195,26 +193,35 @@ class RewardCalculator:
 
         A hit (`target_asin` present in `ranked`) scores 1.0; the caller's session loop
         already ends the session on a hit, so this branch is defensive rather than load
-        bearing. Otherwise the score is the cosine similarity, clipped to [0, 1], between
-        the rank-1 recommendation and the target product.
+        bearing. Otherwise each recommendation is scored in [0, 1] and the turn score is
+        their maximum.
         """
         if target_asin in ranked:
             return 1.0
         if not ranked:
             return 0.0
-        rank1_asin = ranked[0]
-        rank1_product = products.get(rank1_asin)
         target_product = products.get(target_asin)
-        if rank1_product is None or target_product is None:
+        if target_product is None:
             return 0.0
         target_vector = self.embedding_client.embed(target_asin, self.text_fn(target_product))
-        rank1_vector = self.embedding_client.embed(rank1_asin, self.text_fn(rank1_product))
-        raw_similarity = max(0.0, cosine_similarity(rank1_vector, target_vector))
-        baseline = self._target_baseline(target_asin, rank1_asin, target_vector, products)
-        if baseline is None:
-            return raw_similarity
-        margin = max(0.0, raw_similarity - baseline)
-        return min(1.0, margin * self.margin_scale)
+        scores = []
+        for asin in dict.fromkeys(ranked):
+            product = products.get(asin)
+            if product is None:
+                continue
+            vector = self.embedding_client.embed(asin, self.text_fn(product))
+            raw_similarity = min(1.0, max(0.0, cosine_similarity(vector, target_vector)))
+            baseline = self._target_baseline(target_asin, asin, target_vector, products)
+            score = (
+                raw_similarity
+                if baseline is None
+                else min(
+                    1.0,
+                    max(0.0, raw_similarity - baseline) / max(1e-12, 1.0 - baseline),
+                )
+            )
+            scores.append(score)
+        return max(scores, default=0.0)
 
     def _target_baseline(
         self,

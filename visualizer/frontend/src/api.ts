@@ -4,6 +4,7 @@ import type {
   CatalogFilters,
   CatalogSearchInput,
   DatasetOption,
+  EmbeddingProvider,
   ProductSummary,
   ReplyModel,
   SampleSummary,
@@ -35,11 +36,12 @@ export function createSession(
   sampleId: string,
   dataset: string,
   replyModel: ReplyModel,
+  embeddingProvider: EmbeddingProvider,
   debug: boolean,
 ): Promise<SimulatorSession> {
   return request('/api/sessions', {
     method: 'POST',
-    body: JSON.stringify({ sample_id: sampleId, dataset, reply_model: replyModel, debug }),
+    body: JSON.stringify({ sample_id: sampleId, dataset, reply_model: replyModel, embedding_provider: embeddingProvider, debug }),
   })
 }
 
@@ -52,11 +54,12 @@ export function createAutoSession(
   dataset: string,
   agent: AgentName,
   replyModel: ReplyModel,
+  embeddingProvider: EmbeddingProvider,
   debug: boolean,
 ): Promise<SimulatorSession> {
   return request('/api/auto-sessions', {
     method: 'POST',
-    body: JSON.stringify({ sample_id: sampleId, dataset, agent, reply_model: replyModel, debug }),
+    body: JSON.stringify({ sample_id: sampleId, dataset, agent, reply_model: replyModel, embedding_provider: embeddingProvider, debug }),
   })
 }
 
@@ -74,10 +77,11 @@ export function createHumanSession(
   sampleId: string,
   dataset: string,
   agent: AgentName,
+  embeddingProvider: EmbeddingProvider,
 ): Promise<SimulatorSession> {
   return request('/api/human-sessions', {
     method: 'POST',
-    body: JSON.stringify({ sample_id: sampleId, dataset, agent }),
+    body: JSON.stringify({ sample_id: sampleId, dataset, agent, embedding_provider: embeddingProvider }),
   })
 }
 

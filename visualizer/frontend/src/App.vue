@@ -103,14 +103,15 @@ async function start(options: SessionStartOptions) {
   error.value = ''
   try {
     const created = options.mode === 'human_as_agent'
-      ? await createSession(options.sampleId, options.dataset, options.replyModel, options.debug)
+      ? await createSession(options.sampleId, options.dataset, options.replyModel, options.embeddingProvider, options.debug)
       : options.mode === 'human_as_simulator'
-        ? await createHumanSession(options.sampleId, options.dataset, options.agent)
+        ? await createHumanSession(options.sampleId, options.dataset, options.agent, options.embeddingProvider)
         : await createAutoSession(
             options.sampleId,
             options.dataset,
             options.agent,
             options.replyModel,
+            options.embeddingProvider,
             options.debug,
           )
     session.value = created

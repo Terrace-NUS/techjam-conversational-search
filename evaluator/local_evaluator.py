@@ -19,7 +19,7 @@ from evaluator.reply_model import (
 )
 from evaluator.simulators import build_simulator
 from starter.agent import Agent, build_agent
-from scripts.intent_manager import IntentManager
+from scripts.intent_manager import IntentManager, VALID_INTENTS
 from scripts.structured_text import structured_product_text
 
 if TYPE_CHECKING:
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 MAX_TURNS = 10
 TOP_K = 10
-DEFAULT_INTENT_THRESHOLD = 0.5
+DEFAULT_INTENT_THRESHOLD = None
 
 
 def load_jsonl(path: str | Path) -> list[dict]:
@@ -150,12 +150,12 @@ def _evaluate_sample(
     reply_model: ReplyModel,
     agent_lock: threading.Lock,
     reward_calculator: "RewardCalculator | None" = None,
-    intent_threshold: float = DEFAULT_INTENT_THRESHOLD,
+    intent_threshold: float | None = DEFAULT_INTENT_THRESHOLD,
 ) -> tuple[dict, int, int]:
     session_id = f"public_{uuid.uuid4().hex}"
     simulator = build_simulator(sample, categories, products, reply_model, session_id)
     initial_intent = sample.get("intent")
-    if initial_intent not in {"buying", "browsing"}:
+    if initial_intent not in VALID_INTENTS:
         initial_intent = "buying" if sample.get("scenario_type") == "buying" else "browsing"
     intent_manager = IntentManager(initial_intent, threshold=intent_threshold)
     with agent_lock:
@@ -200,7 +200,7 @@ def evaluate(
     progress: bool = False,
     max_workers: int = 1,
     reward_calculator: "RewardCalculator | None" = None,
-    intent_threshold: float = DEFAULT_INTENT_THRESHOLD,
+    intent_threshold: float | None = DEFAULT_INTENT_THRESHOLD,
 ) -> dict:
     reply_model = reply_model or TemplateReplyModel()
     if max_workers < 1:
@@ -293,7 +293,7 @@ def main() -> None:
         "--intent-threshold",
         type=float,
         default=DEFAULT_INTENT_THRESHOLD,
-        help="Subscore threshold for the Intent Manager's browsing->buying escalation.",
+        help="Optional subscore threshold overriding both stage defaults.",
     )
     parser.add_argument(
         "--embedding-provider",

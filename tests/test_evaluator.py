@@ -327,12 +327,49 @@ class EvaluatorTest(unittest.TestCase):
             "correction_messages": {"style": {"browsing": "Correction: true style", "buying": "Correction: true style"}},
             "modify_turn": 3,
         }
+        simulator = V2Simulator(
+            sample,
+            categories,
+            products,
+            TemplateReplyModel(),
+            "pre-modification-hit",
+        )
+        self.assertTrue(simulator.ready_for_hit)
         agent = ModificationAgent()
         result = evaluate(agent, [sample], catalog_ids, categories, products)
         self.assertEqual(result["hit_rate_at_10"], 1.0)
         self.assertEqual(result["sessions"][0]["version"], "v2")
         self.assertIn("fake style", agent.messages)
         self.assertTrue(any("Correction: true style" in message for message in agent.messages))
+
+    def test_custom_override_silently_expires_before_first_fakeable_question(self) -> None:
+        product = {"parent_asin": "A"}
+        sample = {
+            "version": "v2",
+            "sample_id": "override_expired",
+            "intent": "buying",
+            "override": True,
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+            "item_id": "A",
+            "features": product,
+            "intent_descriptions": {
+                "buying": {"style": "true style", "feature": "true feature"},
+            },
+            "fake_attributes": {"style": {"buying": "fake style"}},
+            "correction_messages": {"style": {"buying": "Correction: true style"}},
+            "modify_turn": 3,
+        }
+        simulator = V2Simulator(
+            sample,
+            {"A": ["Clothing", "Shirts"]},
+            {"A": product},
+            TemplateReplyModel(),
+            "expired-override",
+        )
+
+        self.assertEqual(simulator.next_message({"ask_attribute": "feature"}, 1), "true feature")
+        self.assertEqual(simulator.next_message({"ask_attribute": "style"}, 3), "true style")
 
     def test_v2_without_modification_uses_embedded_item(self) -> None:
         product = {"parent_asin": "A"}
@@ -397,6 +434,41 @@ class EvaluatorTest(unittest.TestCase):
         self.assertEqual(
             simulator.initial_message(),
             "I'm looking for fitted shirts.",
+        )
+
+    def test_v2_discovery_initial_message_uses_open_category_goal(self) -> None:
+        product = {"parent_asin": "A"}
+        sample = {
+            "version": "v2",
+            "sample_id": "discover_1",
+            "intent": "discovery",
+            "override": False,
+            "user_profile": {},
+            "ground_truth": {"parent_asin": "A"},
+            "item_id": "A",
+            "features": product,
+            "intent_descriptions": {
+                "discovery": {
+                    "brand": ["maker undecided"],
+                    "category": ["everyday styling", "finishing touch"],
+                },
+                "browsing": {"category": "I'm browsing accessories."},
+                "buying": {"category": "I want a necklace."},
+            },
+            "fake_attributes": {},
+            "correction_messages": {},
+            "modify_turn": None,
+        }
+        simulator = V2Simulator(
+            sample,
+            {"A": ["Clothing", "Accessories"]},
+            {"A": product},
+            TemplateReplyModel(),
+            "discovery-session",
+        )
+        self.assertEqual(
+            simulator.initial_message(),
+            "everyday styling; finishing touch",
         )
 
     def test_mixed_dataset_switches_logic_per_record(self) -> None:

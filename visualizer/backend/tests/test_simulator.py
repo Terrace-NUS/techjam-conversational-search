@@ -7,10 +7,32 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from scripts.intent_manager import IntentManager
 from visualizer.backend.app.main import SimulatorService, create_app
 
 
 class VisualizerApiTest(unittest.TestCase):
+    def test_turn_subscore_is_maximum_recommendation_score(self) -> None:
+        class FixedScores:
+            def score_turn(self, ranked, target, products):
+                return {"LOW": 0.2, "HIGH": 0.9}[ranked[0]]
+
+        service = SimulatorService.__new__(SimulatorService)
+        service.products = {"LOW": {}, "HIGH": {}, "TARGET": {}}
+        service.reward_calculators = {"gemini": FixedScores()}
+        session = {
+            "intent_manager": IntentManager("browsing"),
+            "embedding_provider": "gemini",
+            "target": "TARGET",
+            "debug": True,
+            "score_error": None,
+        }
+
+        metrics = service.turn_metrics(session, ["LOW", "HIGH"], update_intent=False)
+
+        self.assertEqual(metrics["recommendation_scores"], {"LOW": 0.2, "HIGH": 0.9})
+        self.assertEqual(metrics["subscore"], 0.9)
+
     def test_intent_override_redacts_target_and_only_scores_after_override(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -103,9 +125,15 @@ class VisualizerApiTest(unittest.TestCase):
 
                 debug_view = client.post(
                     "/api/sessions",
-                    json={"sample_id": "override-1", "dataset": "samples", "debug": True},
+                    json={
+                        "sample_id": "override-1",
+                        "dataset": "samples",
+                        "embedding_provider": "siliconflow",
+                        "debug": True,
+                    },
                 ).json()
                 self.assertEqual(debug_view["debug_target_product"]["parent_asin"], "TARGET")
+                self.assertEqual(debug_view["embedding_provider"], "siliconflow")
                 client.post(f"/api/sessions/{debug_view['id']}/initialize")
                 debug_view = client.post(
                     f"/api/sessions/{debug_view['id']}/turn",

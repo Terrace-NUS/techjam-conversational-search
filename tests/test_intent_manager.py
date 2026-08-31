@@ -17,6 +17,15 @@ class IntentManagerTest(unittest.TestCase):
         self.assertTrue(manager.update(0.5))
         self.assertEqual(manager.intent, "buying")
 
+    def test_discovery_advances_one_stage_per_update(self) -> None:
+        manager = IntentManager("discovery")
+        self.assertFalse(manager.update(0.29))
+        self.assertTrue(manager.update(0.3))
+        self.assertEqual(manager.intent, "browsing")
+        self.assertFalse(manager.update(0.49))
+        self.assertTrue(manager.update(0.5))
+        self.assertEqual(manager.intent, "buying")
+
     def test_buying_never_escalates_or_reverts(self) -> None:
         manager = IntentManager("browsing", threshold=0.5)
         manager.update(0.9)

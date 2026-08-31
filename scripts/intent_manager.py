@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-VALID_INTENTS = ("browsing", "buying")
+VALID_INTENTS = ("discovery", "browsing", "buying")
+NEXT_INTENT = dict(zip(VALID_INTENTS, VALID_INTENTS[1:]))
+TRANSITION_THRESHOLDS = {"discovery": 0.3, "browsing": 0.5}
 
 
 @dataclass
 class IntentManager:
-    """Per-session intent state machine: browsing escalates to buying, never back.
+    """Per-session intent state machine: discovery -> browsing -> buying, never back.
 
     `update()` is fed one subscore per non-hit turn (see RewardCalculator). Once the
     intent reaches "buying" it stays there for the rest of the session; a session that
@@ -15,18 +17,24 @@ class IntentManager:
     """
 
     intent: str
-    threshold: float = 0.8
+    threshold: float | None = None
 
     def __post_init__(self) -> None:
         if self.intent not in VALID_INTENTS:
             raise ValueError(f"unknown intent: {self.intent}")
 
     def update(self, subscore: float) -> bool:
-        """Escalate browsing -> buying when `subscore` clears the threshold.
+        """Advance one intent stage when `subscore` clears the threshold.
 
         Returns True exactly when this call caused an escalation.
         """
-        if self.intent == "browsing" and subscore >= self.threshold:
-            self.intent = "buying"
+        if self.intent in NEXT_INTENT and subscore >= self.current_threshold:
+            self.intent = NEXT_INTENT[self.intent]
             return True
         return False
+
+    @property
+    def current_threshold(self) -> float:
+        return self.threshold if self.threshold is not None else TRANSITION_THRESHOLDS.get(
+            self.intent, 0.5
+        )

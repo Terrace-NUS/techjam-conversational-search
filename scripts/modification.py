@@ -4,14 +4,21 @@ import random
 import re
 from pathlib import Path
 
-from starter.v1.catalog import ATTRIBUTES, COLORS, MATERIALS, SIZE_WORDS, STYLE_WORDS, USE_CASE_WORDS
+from starter.v1.catalog import (
+    ATTRIBUTES,
+    COLORS,
+    MATERIALS,
+    SIZE_WORDS,
+    STYLE_WORDS,
+    USE_CASE_WORDS,
+)
 
 from .attributes import (
     PRICE_BAND_LABELS,
     band_reference_price,
     browsing_budget_ceiling,
 )
-from .llm_client import DeepSeekAttributeWriter, cached_json_call
+from .llm_client import DeepSeekAttributeWriter
 from .schema import Modification
 
 # Global vocabulary used to select deterministic fake attribute values.
@@ -25,17 +32,13 @@ FAKE_VALUE_VOCAB: dict[str, tuple[str, ...]] = {
 }
 assert set(FAKE_VALUE_VOCAB) == set(ATTRIBUTES)
 
-MODIFY_TURN_CHOICES = (3, 4)
-FAKE_ATTRIBUTE_COUNT_WEIGHTS = ((1, 0.7), (2, 0.3))
-
-
-def _choose_fake_attribute_count(rng: random.Random) -> int:
-    counts, weights = zip(*FAKE_ATTRIBUTE_COUNT_WEIGHTS)
-    return rng.choices(counts, weights=weights, k=1)[0]
+MODIFY_TURN_CHOICES = tuple(range(3, 8))
 
 
 def _value_tokens(value: str) -> set[str]:
-    return {token for token in re.findall(r"[a-z0-9]+", value.casefold()) if len(token) > 2}
+    return {
+        token for token in re.findall(r"[a-z0-9]+", value.casefold()) if len(token) > 2
+    }
 
 
 def _conflicts_with_truth(candidate: str, true_value: str) -> bool:
@@ -57,7 +60,9 @@ def _choose_fake_value(
     rng: random.Random,
 ) -> str | None:
     if attribute == "budget":
-        candidates = sorted(value for value in FAKE_VALUE_VOCAB["budget"] if value != true_value)
+        candidates = sorted(
+            value for value in FAKE_VALUE_VOCAB["budget"] if value != true_value
+        )
     else:
         candidates = sorted(
             value
@@ -73,23 +78,28 @@ def build_modification(
     product: dict,
     item_id: str,
     true_attributes: dict[str, str],
+    true_descriptions: dict[str, dict[str, object]],
     writer: DeepSeekAttributeWriter,
     cache_dir: Path,
 ) -> Modification | None:
     """Build a Modification for one item, or None if it has no fakeable attributes."""
     category = true_attributes.get("category", "clothing item")
-    fakeable = sorted(attribute for attribute in ATTRIBUTES if attribute in true_attributes)
+    modification_values = dict(true_attributes)
+    size_options = modification_values.pop("size_options", None)
+    if size_options and "size" not in modification_values:
+        modification_values["size"] = f"available options: {size_options}"
+    fakeable = sorted(
+        attribute for attribute in ATTRIBUTES if attribute in modification_values
+    )
     if not fakeable:
         return None
 
-    count_rng = random.Random(f"{item_id}:modify_attrs")
-    count = min(_choose_fake_attribute_count(count_rng), len(fakeable))
-    chosen = count_rng.sample(fakeable, k=count)[:1]
-
     fake_values: dict[str, str] = {}
-    for attribute in chosen:
+    for attribute in fakeable:
         value_rng = random.Random(f"{item_id}:{attribute}:fake_value")
-        fake_value = _choose_fake_value(attribute, true_attributes[attribute], value_rng)
+        fake_value = _choose_fake_value(
+            attribute, modification_values[attribute], value_rng
+        )
         if fake_value is not None:
             fake_values[attribute] = fake_value
     if not fake_values:
@@ -99,21 +109,24 @@ def build_modification(
     if "budget" in fake_values:
         price_rng = random.Random(f"{item_id}:budget:fake_price")
         exact_price = band_reference_price(fake_values["budget"], price_rng)
-        budget_context = {"exact_price": exact_price, "browsing_ceiling": browsing_budget_ceiling(exact_price)}
+        budget_context = {
+            "exact_price": exact_price,
+            "browsing_ceiling": browsing_budget_ceiling(exact_price),
+        }
 
-    cache_path = cache_dir / f"{item_id}.json"
-    generated = cached_json_call(
-        cache_path,
-        lambda: writer.describe_modification(
-            category, fake_values, true_attributes, budget_context
-        ),
+    generated = writer.describe_modification(
+        category,
+        fake_values,
+        true_descriptions,
+        budget_context,
+        cache_dir / f"{item_id}.fragment-lists-v3",
     )
     fake_descriptions = generated["fake_descriptions"]
     correction_messages = generated["correction_messages"]
     fake_attributes = {
         attribute: {
             stage: fake_descriptions[stage][attribute]
-            for stage in ("browsing", "buying")
+            for stage in ("discovery", "browsing", "buying")
         }
         for attribute in fake_values
     }
@@ -126,10 +139,9 @@ def build_modification(
         correction_messages={
             attribute: {
                 stage: correction_messages[stage][attribute]
-                for stage in ("browsing", "buying")
+                for stage in ("discovery", "browsing", "buying")
             }
             for attribute in fake_values
         },
         modify_turn=modify_turn,
     )
-

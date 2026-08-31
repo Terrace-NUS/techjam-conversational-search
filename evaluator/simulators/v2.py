@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from evaluator.reply_model import ReplyModel
-from scripts.schema import Item, Modification
+from scripts.intent_manager import VALID_INTENTS
+from scripts.schema import Item, Modification, clue_text
 from scripts.session import create_session
 
 from .base import Simulator, coarse_category
@@ -13,7 +14,7 @@ class V2Simulator(Simulator):
     @staticmethod
     def _intent(sample: dict) -> str:
         intent = sample.get("intent")
-        if intent not in {"buying", "browsing"}:
+        if intent not in VALID_INTENTS:
             raise ValueError(f"invalid v2 intent: {intent!r}")
         return intent
 
@@ -62,30 +63,29 @@ class V2Simulator(Simulator):
             raise ValueError(f"v2 override sample {sample['sample_id']!r} has no modification")
         fallback_category = coarse_category(categories.get(self.target, []))
         self.descriptions = item.intent_descriptions.get(self.intent, {})
-        self.category = str(self.descriptions.get("category") or fallback_category)
+        self.category = clue_text(self.descriptions.get("category")) or fallback_category
         self.query_handler = create_session(
             str(sample["sample_id"]), item, self.modification, initial_intent=self.intent
         ).query_handler
-        self.override_applied = not self.override
 
     def initial_message(self) -> str:
         if self.intent == "buying":
             canonical = f"I'm looking for {self.category}."
-        else:
+        elif self.intent == "browsing":
             canonical = f"I'm looking for {self.category}, but I'm still exploring."
+        else:
+            canonical = clue_text(
+                self.descriptions.get("category")
+                or next(iter(self.descriptions.values()), self.category)
+            )
         return self.reply_model.rewrite_initial_message(canonical)
 
     @property
     def ready_for_hit(self) -> bool:
-        return self.override_applied
+        return True
 
     def next_message(self, response: dict, next_turn: int) -> str:
         canonical = self.query_handler.answer(response.get("ask_attribute"), next_turn)
-        if not self.override_applied:
-            assert self.modification is not None
-            if next_turn >= self.modification.modify_turn:
-                self.override_applied = True
-                canonical = canonical or "I have updated my preferences."
         canonical = canonical or "I don't have an additional preference for that."
         return self.reply_model.rewrite_query_answer(canonical)
 

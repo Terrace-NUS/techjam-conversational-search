@@ -33,6 +33,7 @@ const intentEntries = computed(() => Object.entries(props.session.human_context?
           <Badge variant="secondary">{{ session.sample.difficulty_bucket }}</Badge>
           <Badge variant="outline">{{ session.sample.category_bucket }}</Badge>
           <Badge v-if="session.agent" variant="outline">{{ session.agent }} agent</Badge>
+          <Badge v-if="session.debug" variant="outline">{{ session.embedding_provider }} embedding</Badge>
         </div>
         <template v-if="session.debug">
           <Separator />

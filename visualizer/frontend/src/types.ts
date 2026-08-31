@@ -28,7 +28,9 @@ export interface DatasetOption {
 }
 
 export type ReplyModel = 'template' | 'deepseek'
+export type EmbeddingProvider = 'gemini' | 'siliconflow'
 export type AgentName = 'baseline' | 'v1'
+export type Intent = 'discovery' | 'browsing' | 'buying'
 export type SessionMode = 'human_as_agent' | 'human_as_simulator' | 'agent_simulator'
 
 export interface SessionStartOptions {
@@ -36,6 +38,7 @@ export interface SessionStartOptions {
   sampleId: string
   dataset: string
   replyModel: ReplyModel
+  embeddingProvider: EmbeddingProvider
   agent: AgentName
   debug: boolean
 }
@@ -95,14 +98,14 @@ export interface TurnRecord {
   recommendations: ProductSummary[]
   hit_rank: number | null
   subscore: number | null
-  intent_before: 'browsing' | 'buying'
-  intent_after: 'browsing' | 'buying'
+  intent_before: Intent
+  intent_after: Intent
   intent_changed: boolean
   recommendation_scores: Record<string, number | null>
 }
 
 export interface SessionMetrics {
-  current_intent: 'browsing' | 'buying'
+  current_intent: Intent
   threshold: number
   last_subscore: number | null
   score_error: string | null
@@ -128,6 +131,7 @@ export interface SimulatorSession {
     | 'error'
   dataset: string
   reply_model: ReplyModel | null
+  embedding_provider: EmbeddingProvider
   agent?: AgentName
   debug: boolean
   initialization_error: string | null
@@ -141,7 +145,7 @@ export interface SimulatorSession {
   human_context?: {
     intent: string
     override: boolean
-    intent_description: Record<string, string> | null
+    intent_description: Record<string, string | string[]> | null
     fake_attributes: Record<string, unknown>
     correction_messages: Record<string, unknown>
     modify_turn: number | null

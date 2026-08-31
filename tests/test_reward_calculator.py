@@ -58,6 +58,19 @@ class RewardCalculatorTest(unittest.TestCase):
         self.assertEqual(calculator.score_turn(["B"], "A", self.products), 0.0)
         self.assertEqual(sorted(client.calls), ["A", "B"])
 
+    def test_turn_score_is_maximum_across_recommendations(self) -> None:
+        products = {asin: {"title": asin} for asin in ("A", "B", "C")}
+        client = FakeEmbeddingClient(
+            {"A": [1.0, 0.0], "B": [0.0, 1.0], "C": [0.8, 0.6]}
+        )
+        calculator = RewardCalculator(
+            client,
+            text_fn=lambda product: product["title"],
+            baseline_sample_size=0,
+        )
+        self.assertEqual(calculator.score_turn(["B", "C"], "A", products), 0.8)
+        self.assertEqual(client.calls, ["A", "B", "C"])
+
     def test_miss_scores_relative_to_catalog_baseline(self) -> None:
         products = {asin: {"title": asin} for asin in ("A", "B", "C", "D")}
         client = FakeEmbeddingClient({
@@ -67,9 +80,9 @@ class RewardCalculatorTest(unittest.TestCase):
             "D": [0.6, 0.8],
         })
         with tempfile.TemporaryDirectory() as directory:
-            calculator = RewardCalculator(client, text_fn=lambda product: product["title"], baseline_sample_size=2, margin_scale=1.0, baseline_cache_path=Path(directory) / "baselines.json")
-            # The result is the positive margin rather than the raw high cosine.
-            self.assertAlmostEqual(calculator.score_turn(["B"], "A", products), 0.1, places=6)
+            calculator = RewardCalculator(client, text_fn=lambda product: product["title"], baseline_sample_size=2, baseline_cache_path=Path(directory) / "baselines.json")
+            # The baseline-to-identical interval is normalized to [0, 1].
+            self.assertAlmostEqual(calculator.score_turn(["B"], "A", products), 0.5, places=6)
 
     def test_baseline_persists_between_calculators(self) -> None:
         products = {asin: {"title": asin} for asin in ("A", "B", "C", "D")}
@@ -77,9 +90,9 @@ class RewardCalculatorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "baselines.json"
             first_client = FakeEmbeddingClient(vectors)
-            RewardCalculator(first_client, lambda p: p["title"], baseline_sample_size=2, margin_scale=1.0, baseline_cache_path=path).score_turn(["B"], "A", products)
+            RewardCalculator(first_client, lambda p: p["title"], baseline_sample_size=2, baseline_cache_path=path).score_turn(["B"], "A", products)
             second_client = FakeEmbeddingClient(vectors)
-            RewardCalculator(second_client, lambda p: p["title"], baseline_sample_size=2, margin_scale=1.0, baseline_cache_path=path).score_turn(["B"], "A", products)
+            RewardCalculator(second_client, lambda p: p["title"], baseline_sample_size=2, baseline_cache_path=path).score_turn(["B"], "A", products)
             self.assertEqual(second_client.calls, ["A", "B"])
 
 
