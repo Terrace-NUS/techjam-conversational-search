@@ -301,7 +301,15 @@ def main() -> None:
         default=os.environ.get("EMBEDDING_PROVIDER", "gemini"),
         help="Embedding API provider (defaults to EMBEDDING_PROVIDER or gemini).",
     )
+    parser.add_argument(
+        "--embedding-workers",
+        type=int,
+        default=8,
+        help="Maximum concurrent embedding requests (default: 8).",
+    )
     args = parser.parse_args()
+    if args.embedding_workers < 1:
+        parser.error("--embedding-workers must be positive")
     samples = load_jsonl(args.dataset)
     catalog_ids, categories, products = catalog_index(args.catalog)
     from scripts.reward_calculator import (
@@ -315,7 +323,11 @@ def main() -> None:
         if args.embedding_provider == "siliconflow"
         else GeminiEmbeddingClient()
     )
-    reward_calculator = RewardCalculator(embedding_client, text_fn=structured_product_text)
+    reward_calculator = RewardCalculator(
+        embedding_client,
+        text_fn=structured_product_text,
+        embedding_workers=args.embedding_workers,
+    )
     result = evaluate(
         build_agent(args.agent, args.catalog),
         samples,

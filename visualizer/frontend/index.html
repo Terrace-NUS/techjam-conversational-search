@@ -3,8 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="TechJam conversational search simulator" />
-    <title>TechJam Simulator</title>
+    <meta name="description" content="APERTURE conversational search visualizer" />
+    <title>APERTURE</title>
     <script>
       const savedTheme = localStorage.getItem('theme')
       const savedPalette = localStorage.getItem('theme-palette')
@@ -13,6 +13,8 @@
         savedTheme === 'dark' || (savedTheme === null && matchMedia('(prefers-color-scheme: dark)').matches),
       )
       document.documentElement.classList.toggle('theme-claude', savedPalette === 'claude')
+      document.documentElement.classList.toggle('theme-whatsapp', savedPalette === 'whatsapp')
+      document.documentElement.classList.toggle('theme-discord', savedPalette === 'discord')
     </script>
   </head>
   <body>

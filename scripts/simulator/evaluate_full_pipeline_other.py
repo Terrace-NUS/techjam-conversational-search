@@ -2,8 +2,9 @@
 
 This file is deliberately an adapter, not a second retrieval implementation.  It
 replays the organizer's public evaluator protocol while keeping the target ASIN on
-the evaluator side of the boundary.  The agent side always asks ``other`` and uses
-the repository's Query Understanding, Session Context, Intent Transparency,
+the evaluator side of the boundary.  The agent asks one explicit natural-language
+shopping question per turn and uses the repository's Query Understanding,
+Session Context, Intent Transparency,
 multi-route retrieval, BGE reranking, and vector DPP selection components.
 
 Every turn and every completed session is appended to JSONL before the next one
@@ -24,7 +25,7 @@ from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
@@ -87,6 +88,7 @@ from shopping_copilot.retrieval import (  # noqa: E402
     IntentVolumeEstimator,
     IntentVolumePolicy,
     ProductCardMode,
+    RankingUserProfile,
     SentenceTransformerCrossEncoderScorer,
     VectorCandidate,
     create_retrieval_controller,
@@ -102,6 +104,7 @@ from shopping_copilot.session_context import (  # noqa: E402
     SessionState,
     TurnRecord,
     encode_snapshot,
+    question_keys_since_goal_switch,
 )
 from shopping_copilot.session_context.models import IntentState  # noqa: E402
 from shopping_copilot.simulator import DeepSeekSurfaceRealizer  # noqa: E402
@@ -136,6 +139,7 @@ class _SessionRuntime:
     last_question: str | None = None
     reusable_key: tuple[str, int] | None = None
     reusable_from_turn: int | None = None
+    event_sink: Callable[[dict[str, object]], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,7 +223,7 @@ class FullPipelineOtherAgent:
         turn: int,
         top_k: int,
     ) -> dict[str, object]:
-        """Run one target-blind turn and always ask the simulator for ``other``."""
+        """Run one target-blind turn and ask one explicit shopping question."""
 
         if top_k != TOP_K:
             raise ValueError(f"this audit expects official top_k={TOP_K}")
@@ -243,8 +247,17 @@ class FullPipelineOtherAgent:
             ),
             last_question=session.last_question,
             allowed_dont_care_facets=self._allowed_dont_care_facets,
+            user_profile=session.raw_profile if turn == 1 else None,
         )
         exact_request = request_payload(request)
+        self._emit(
+            session,
+            {
+                "stage": "query_understanding",
+                "status": "started",
+                "turn": turn,
+            },
+        )
         reuse_key = (_normalized_message(user_message), session.context.state.intent.version)
         if (
             self._repeat_noop_cache
@@ -272,6 +285,16 @@ class FullPipelineOtherAgent:
             )
         except Exception as error:
             timings["query_understanding_ms"] = _elapsed_ms(qu_started)
+            self._emit(
+                session,
+                {
+                    "stage": "query_understanding",
+                    "status": "failed",
+                    "turn": turn,
+                    "elapsed_ms": timings["query_understanding_ms"],
+                    "error": _error_payload(error),
+                },
+            )
             return self._failed_turn(
                 session=session,
                 turn=turn,
@@ -286,12 +309,35 @@ class FullPipelineOtherAgent:
                 resolved=None,
             )
         timings["query_understanding_ms"] = _elapsed_ms(qu_started)
+        self._emit(
+            session,
+            _query_understanding_event(
+                turn=turn,
+                before=session.context.state.intent,
+                resolved=resolved,
+                elapsed_ms=timings["query_understanding_ms"],
+            ),
+        )
 
+        self._emit(
+            session,
+            {"stage": "query_compiler", "status": "started", "turn": turn},
+        )
         compile_started = time.perf_counter()
         try:
             compiled = self._compiler.compile(resolved)
         except Exception as error:
             timings["compile_ms"] = _elapsed_ms(compile_started)
+            self._emit(
+                session,
+                {
+                    "stage": "query_compiler",
+                    "status": "failed",
+                    "turn": turn,
+                    "elapsed_ms": timings["compile_ms"],
+                    "error": _error_payload(error),
+                },
+            )
             return self._failed_turn(
                 session=session,
                 turn=turn,
@@ -306,7 +352,21 @@ class FullPipelineOtherAgent:
                 resolved=resolved,
             )
         timings["compile_ms"] = _elapsed_ms(compile_started)
+        self._emit(
+            session,
+            {
+                "stage": "query_compiler",
+                "status": "completed",
+                "turn": turn,
+                "elapsed_ms": timings["compile_ms"],
+                "compiled_query": _json_value(compiled),
+            },
+        )
 
+        self._emit(
+            session,
+            {"stage": "intent_transparency", "status": "started", "turn": turn},
+        )
         volume_started = time.perf_counter()
         try:
             with self._local_model_lock:
@@ -326,7 +386,23 @@ class FullPipelineOtherAgent:
             applied_transparency = 0.5
             transparency_error = _error_payload(error)
         timings["intent_transparency_ms"] = _elapsed_ms(volume_started)
+        self._emit(
+            session,
+            {
+                "stage": "intent_transparency",
+                "status": "completed" if transparency_error is None else "fallback",
+                "turn": turn,
+                "elapsed_ms": timings["intent_transparency_ms"],
+                "estimate": None if transparency is None else transparency.as_payload(),
+                "applied_transparency": applied_transparency,
+                "error": transparency_error,
+            },
+        )
 
+        self._emit(
+            session,
+            {"stage": "retrieval", "status": "started", "turn": turn},
+        )
         retrieval_started = time.perf_counter()
         try:
             with self._local_model_lock:
@@ -336,6 +412,16 @@ class FullPipelineOtherAgent:
                 )
         except Exception as error:
             timings["retrieval_ms"] = _elapsed_ms(retrieval_started)
+            self._emit(
+                session,
+                {
+                    "stage": "retrieval",
+                    "status": "failed",
+                    "turn": turn,
+                    "elapsed_ms": timings["retrieval_ms"],
+                    "error": _error_payload(error),
+                },
+            )
             return self._failed_turn(
                 session=session,
                 turn=turn,
@@ -354,7 +440,22 @@ class FullPipelineOtherAgent:
                 transparency_error=transparency_error,
             )
         timings["retrieval_ms"] = _elapsed_ms(retrieval_started)
+        retrieval_display = _retrieval_display_payload(retrieval, self._metadata)
+        self._emit(
+            session,
+            {
+                "stage": "retrieval",
+                "status": "completed",
+                "turn": turn,
+                "elapsed_ms": timings["retrieval_ms"],
+                **retrieval_display,
+            },
+        )
 
+        self._emit(
+            session,
+            {"stage": "ranking", "status": "started", "turn": turn},
+        )
         ranking_started = time.perf_counter()
         ranking_error: dict[str, object] | None = None
         bge_result: Any | None = None
@@ -371,6 +472,11 @@ class FullPipelineOtherAgent:
                     compiled_query=compiled,
                     retrieval=retrieval,
                     top_k=top_k,
+                    user_profile=RankingUserProfile(
+                        schema="techjam_user_profile",
+                        version=1,
+                        payload=session.raw_profile,
+                    ),
                 )
             except Exception as error:
                 ranking_error = _error_payload(error)
@@ -415,6 +521,24 @@ class FullPipelineOtherAgent:
             recommendations = [item.parent_asin for item in retrieval.hits[:top_k]]
             ranking_mode = "formal_mmr"
         timings["ranking_ms"] = _elapsed_ms(ranking_started)
+        ranking_display = _ranking_display_payload(
+            mode=ranking_mode,
+            recommendations=recommendations,
+            retrieval=retrieval,
+            coordinated=coordinated_ranking,
+            metadata=self._metadata,
+        )
+        self._emit(
+            session,
+            {
+                "stage": "ranking",
+                "status": "completed",
+                "turn": turn,
+                "elapsed_ms": timings["ranking_ms"],
+                "error": ranking_error,
+                **ranking_display,
+            },
+        )
 
         response_narrative: ResponseNarrative | None = None
         if self._response_composer is not None:
@@ -431,6 +555,7 @@ class FullPipelineOtherAgent:
                 ranking=coordinated_ranking,
                 intent=resolved.final_intent,
                 product_metadata=self._metadata,
+                asked_attributes=_asked_attributes(session.context),
             )
         question = (
             ASSISTANT_QUESTION if response_narrative is None else response_narrative.follow_up
@@ -440,6 +565,11 @@ class FullPipelineOtherAgent:
             resolved=resolved,
             ranking=coordinated_ranking,
             message=(None if response_narrative is None else response_narrative.message),
+            ask_attribute=(
+                ASK_ATTRIBUTE
+                if response_narrative is None
+                else response_narrative.question_attribute
+            ),
         )
         session.context = _advance_context(
             session.context,
@@ -469,6 +599,7 @@ class FullPipelineOtherAgent:
                 "error": transparency_error,
             },
             "retrieval": _retrieval_payload(retrieval),
+            "retrieval_display": retrieval_display,
             "ranking": _ranking_payload(
                 mode=ranking_mode,
                 bge_result=bge_result,
@@ -477,6 +608,7 @@ class FullPipelineOtherAgent:
                 error=ranking_error,
                 coordinated=coordinated_ranking,
             ),
+            "ranking_display": ranking_display,
             "response_narrative": _json_value(response_narrative),
             "recommendation_products": _recommendation_products(
                 recommendations,
@@ -510,6 +642,18 @@ class FullPipelineOtherAgent:
         if audit is None:
             raise LookupError("the session has no completed turn")
         return audit
+
+    def set_event_sink(
+        self,
+        session_id: str,
+        sink: Callable[[dict[str, object]], None] | None,
+    ) -> None:
+        self._sessions[session_id].event_sink = sink
+
+    @staticmethod
+    def _emit(session: _SessionRuntime, event: dict[str, object]) -> None:
+        if session.event_sink is not None:
+            session.event_sink(event)
 
     def _resolve_with_retry(
         self,
@@ -546,22 +690,103 @@ class FullPipelineOtherAgent:
         assert session.last_response is not None
         assert session.last_pipeline is not None
         response = dict(session.last_response)
+        self._emit(
+            session,
+            {
+                "stage": "query_understanding",
+                "status": "reused",
+                "turn": turn,
+                "elapsed_ms": 0.0,
+                "diff": _intent_diff(
+                    session.context.state.intent,
+                    session.context.state.intent,
+                ),
+                "intent": _intent_payload(session.context.state.intent),
+                "operations": [],
+                "interpretation_summary": "Repeated unchanged input reused the previous intent.",
+            },
+        )
         response["usage"] = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
         }
+        pipeline = _json_round_trip(session.last_pipeline)
+        self._emit(
+            session,
+            {
+                "stage": "query_compiler",
+                "status": "reused",
+                "turn": turn,
+                "elapsed_ms": 0.0,
+                "compiled_query": pipeline.get("compiled_query"),
+            },
+        )
+        transparency_payload = cast(dict[str, object], pipeline["intent_transparency"])
+        self._emit(
+            session,
+            {
+                "stage": "intent_transparency",
+                "status": "reused",
+                "turn": turn,
+                "elapsed_ms": 0.0,
+                "estimate": transparency_payload.get("estimate"),
+                "applied_transparency": transparency_payload.get("applied_transparency"),
+                "error": transparency_payload.get("error"),
+            },
+        )
+        self._emit(
+            session,
+            {
+                "stage": "retrieval",
+                "status": "reused",
+                "turn": turn,
+                **cast(dict[str, object], pipeline.get("retrieval_display", {})),
+            },
+        )
+        self._emit(
+            session,
+            {
+                "stage": "ranking",
+                "status": "reused",
+                "turn": turn,
+                **cast(dict[str, object], pipeline.get("ranking_display", {})),
+            },
+        )
+        question = session.last_question or ASSISTANT_QUESTION
+        if self._response_composer is not None:
+            estimate = session.previous_transparency
+            applied_transparency = (
+                0.5
+                if estimate is None or estimate.transparency is None
+                else float(estimate.transparency)
+            )
+            narrative = self._response_composer.compose(
+                recommendations=tuple(
+                    str(item) for item in cast(list[object], response["recommendations"])
+                ),
+                transparency=applied_transparency,
+                previous_transparency=applied_transparency,
+                ranking=None,
+                intent=session.context.state.intent,
+                product_metadata=self._metadata,
+                asked_attributes=_asked_attributes(session.context),
+            )
+            response["message"] = narrative.message
+            response["ask_attribute"] = narrative.question_attribute
+            question = narrative.follow_up
+            pipeline["response_narrative"] = _json_value(narrative)
         session.context = _advance_context(
             session.context,
             turn=turn,
             user_message=user_message,
             resolved=None,
             response=response,
-            question=session.last_question or ASSISTANT_QUESTION,
+            question=question,
         )
         context_after = _context_payload(session.context, self._facet_registry)
         session.last_response = response
-        pipeline = _json_round_trip(session.last_pipeline)
+        session.last_question = question
         timings = {"total_agent_ms": _elapsed_ms(started)}
         session.last_turn_audit = {
             "schema": TURN_SCHEMA,
@@ -860,7 +1085,7 @@ def main() -> int:
             "remaining_sample_count": len(selected),
         },
         "adapter_policy": {
-            "ask_attribute": ASK_ATTRIBUTE,
+            "ask_attribute": "dynamic_natural_language",
             "top_k": TOP_K,
             "max_turns": args.max_turns,
             "session_workers": args.workers,
@@ -998,8 +1223,8 @@ def _run_session(
     for turn in range(1, max_turns + 1):
         disclosed_before = sorted(disclosed)
         response = agent.respond(session_id, user_message, turn, TOP_K)
-        if response.get("ask_attribute") != ASK_ATTRIBUTE:
-            raise AssertionError("fixed-other adapter returned a different ask_attribute")
+        if not isinstance(response.get("ask_attribute"), str):
+            raise AssertionError("agent returned no ask_attribute")
         audit = agent.last_audit(session_id)
         usage = response.get("usage")
         if type(usage) is dict:
@@ -1078,7 +1303,7 @@ def _run_session(
             else:
                 canonical_user_message, boundary_used = customer_reply(
                     effective_sample,
-                    ASK_ATTRIBUTE,
+                    response["ask_attribute"],
                     disclosed,
                     boundary_used,
                 )
@@ -1179,8 +1404,8 @@ def _advance_context(
         intent_version_after=after.version,
         assistant_message=str(response["message"]),
         question=question,
-        question_key=f"ask_attribute:{ASK_ATTRIBUTE}",
-        ask_attribute=ASK_ATTRIBUTE,
+        question_key=f"ask_attribute:{response['ask_attribute']}",
+        ask_attribute=cast(str, response["ask_attribute"]),
         shown_product_ids=tuple(
             str(item) for item in cast(list[object], response["recommendations"])
         ),
@@ -1198,12 +1423,21 @@ def _advance_context(
     )
 
 
+def _asked_attributes(context: SessionContext) -> tuple[str, ...]:
+    return tuple(
+        key.removeprefix("ask_attribute:")
+        for key in question_keys_since_goal_switch(context.state.interaction)
+        if key.startswith("ask_attribute:")
+    )
+
+
 def _agent_response(
     recommendations: list[str],
     *,
     resolved: ResolvedTurnIntent | None,
     ranking: RealWorldRankingResult | None = None,
     message: str | None = None,
+    ask_attribute: str = ASK_ATTRIBUTE,
 ) -> dict[str, object]:
     traces = () if resolved is None else resolved.trace.attempts
     prompt_tokens = sum(item.prompt_tokens or 0 for item in traces)
@@ -1218,7 +1452,7 @@ def _agent_response(
             if message is None
             else message
         ),
-        "ask_attribute": ASK_ATTRIBUTE,
+        "ask_attribute": ask_attribute,
         "recommendations": recommendations[:TOP_K],
         "usage": {
             "prompt_tokens": prompt_tokens,
@@ -1299,6 +1533,61 @@ def _retrieval_payload(result: Any) -> dict[str, object]:
     }
 
 
+def _product_preview(
+    parent_asin: str,
+    metadata: dict[str, dict[str, object]],
+) -> dict[str, str]:
+    title = metadata.get(parent_asin, {}).get("title")
+    return {"title": str(title or "Untitled product")}
+
+
+def _retrieval_display_payload(
+    result: Any,
+    metadata: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "eligible_count": len(result.hard_mask.eligible_parent_asins),
+        "fused_count": len(result.fused_candidates),
+        "routes": [
+            {
+                "route": route.route.value,
+                "available": route.available,
+                "hit_count": len(route.hits),
+                "top_hits": [
+                    _product_preview(hit.parent_asin, metadata) for hit in route.hits[:2]
+                ],
+            }
+            for route in result.routes
+        ],
+    }
+
+
+def _ranking_display_payload(
+    *,
+    mode: str,
+    recommendations: list[str],
+    retrieval: Any,
+    coordinated: RealWorldRankingResult | None,
+    metadata: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    reason = None
+    if coordinated is not None and coordinated.quality_pipeline is not None:
+        by_asin = {
+            hit.parent_asin: hit.reason
+            for hit in coordinated.quality_pipeline.quality_ranking.hits
+            if hit.reason
+        }
+        reason = next((by_asin[item] for item in recommendations if item in by_asin), None)
+    return {
+        "mode": mode,
+        "candidate_count": len(retrieval.fused_candidates),
+        "selected_products": [
+            _product_preview(parent_asin, metadata) for parent_asin in recommendations
+        ],
+        "natural_language_reason": reason,
+    }
+
+
 def _ranking_payload(
     *,
     mode: str,
@@ -1361,6 +1650,75 @@ def _context_payload(context: SessionContext, registry: Any) -> dict[str, object
     return cast(dict[str, object], decoded)
 
 
+def _query_understanding_event(
+    *,
+    turn: int,
+    before: IntentState,
+    resolved: ResolvedTurnIntent,
+    elapsed_ms: float,
+) -> dict[str, object]:
+    return {
+        "stage": "query_understanding",
+        "status": "completed",
+        "turn": turn,
+        "elapsed_ms": elapsed_ms,
+        "diff": _intent_diff(before, resolved.final_intent),
+        "intent": _intent_payload(resolved.final_intent),
+        "operations": (
+            [] if resolved.update is None else _json_value(resolved.update.operations)
+        ),
+        "interpretation_summary": resolved.trace.interpretation_summary,
+    }
+
+
+def _intent_diff(before: IntentState, after: IntentState) -> dict[str, object]:
+    before_preferences = {item.id: item for item in before.preferences}
+    after_preferences = {item.id: item for item in after.preferences}
+    return {
+        "goal": {
+            "before": before.goal,
+            "after": after.goal,
+            "changed": before.goal != after.goal,
+        },
+        "preferences": {
+            "added": [
+                _preference_payload(after_preferences[key])
+                for key in sorted(after_preferences.keys() - before_preferences.keys())
+            ],
+            "removed": [
+                _preference_payload(before_preferences[key])
+                for key in sorted(before_preferences.keys() - after_preferences.keys())
+            ],
+        },
+        "dont_care": {
+            "added": sorted(after.dont_care_facets - before.dont_care_facets),
+            "removed": sorted(before.dont_care_facets - after.dont_care_facets),
+        },
+        "version": {"before": before.version, "after": after.version},
+    }
+
+
+def _intent_payload(intent: IntentState) -> dict[str, object]:
+    return {
+        "goal": intent.goal,
+        "preferences": [_preference_payload(item) for item in intent.preferences],
+        "dont_care_facets": sorted(intent.dont_care_facets),
+        "version": intent.version,
+    }
+
+
+def _preference_payload(preference: Any) -> dict[str, object]:
+    return {
+        "id": preference.id,
+        "facet": preference.facet,
+        "operator": None if preference.operator is None else preference.operator.value,
+        "value": _json_value(preference.value),
+        "semantic_text": preference.semantic_text,
+        "commitment": preference.commitment.value,
+        "evidence_text": preference.evidence_text,
+    }
+
+
 def _json_value(value: object) -> object:
     if value is None or type(value) in (str, bool, int):
         return value
@@ -1415,11 +1773,11 @@ def _render_summary(summary: dict[str, object]) -> str:
     runtime = cast(dict[str, object], summary["runtime"])
     scenario_metrics = cast(dict[str, dict[str, object]], metrics["scenario_metrics"])
     lines = [
-        "# Official public simulator · full-pipeline fixed-other run",
+        "# Official public simulator · full-pipeline run",
         "",
         "This is an integration smoke test of the real architecture behind a thin official-API adapter.",
         "The target ASIN stayed in the evaluator and was never passed to Query Understanding or retrieval.",
-        "Every response used `ask_attribute = other`.",
+        "Every response asked one explicit natural-language shopping question.",
         "",
         "## Overall",
         "",

@@ -1,5 +1,6 @@
 import type {
   AgentTurnInput,
+  AgentPipelineEvent,
   AgentName,
   CatalogFilters,
   CatalogSearchInput,
@@ -10,6 +11,15 @@ import type {
   SampleSummary,
   SimulatorSession,
 } from './types'
+
+export function watchSessionEvents(
+  sessionId: string,
+  onEvent: (event: AgentPipelineEvent) => void,
+): EventSource {
+  const source = new EventSource(`/api/sessions/${encodeURIComponent(sessionId)}/events`)
+  source.onmessage = (message) => onEvent(JSON.parse(message.data) as AgentPipelineEvent)
+  return source
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {

@@ -831,6 +831,31 @@ class DeepSeekAttributeWriterTest(unittest.TestCase):
                 None,
             )
 
+    def test_buying_descriptive_clues_reject_catalog_fingerprints(self) -> None:
+        for clues, error in (
+            (["Triple Moon Pentagram Symbol"], "copy the catalog value"),
+            (["a Triple Moon Pentagram motif"], "three consecutive source words"),
+            (["symbolic motif with 3 moons"], "exact numbers"),
+            (["symbolic motif with three moons"], "exact numbers"),
+            (["weatherproof daily use"], "strengthen qualities"),
+        ):
+            with self.subTest(clues=clues):
+                with self.assertRaisesRegex(ValueError, error):
+                    DeepSeekAttributeWriter._validate_stage_clues(
+                        "feature",
+                        "Triple Moon Pentagram Symbol",
+                        "buying",
+                        clues,
+                        None,
+                    )
+        DeepSeekAttributeWriter._validate_stage_clues(
+            "feature",
+            "Triple Moon Pentagram Symbol",
+            "buying",
+            ["pagan moon-and-star motif"],
+            None,
+        )
+
     def test_validate_extraction_shape_rejects_bare_attribute_strings(self) -> None:
         invalid = {
             "material": "Stainless Steel",

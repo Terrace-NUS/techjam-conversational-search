@@ -103,6 +103,7 @@ class ReconcileRequest:
     category_options: tuple[CategoryOption, ...]
     shown_products: tuple[ShownProductView, ...]
     allowed_dont_care_facets: tuple[str, ...] = ()
+    user_profile: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

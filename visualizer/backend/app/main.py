@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
+from queue import Empty, Queue
 from threading import Lock
 from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -69,7 +72,7 @@ class CreateHumanSessionRequest(BaseModel):
 
     sample_id: str = Field(min_length=1)
     dataset: str | None = Field(default=None, min_length=1)
-    agent: Literal["baseline", "v1"] = "v1"
+    agent: Literal["baseline", "v1", "terrace"] = "v1"
     embedding_provider: EmbeddingProvider = "gemini"
 
 
@@ -78,7 +81,7 @@ class CreateAutoSessionRequest(BaseModel):
 
     sample_id: str = Field(min_length=1)
     dataset: str | None = Field(default=None, min_length=1)
-    agent: Literal["baseline", "v1"] = "v1"
+    agent: Literal["baseline", "v1", "terrace"] = "v1"
     reply_model: Literal["template", "deepseek"] = "deepseek"
     embedding_provider: EmbeddingProvider = "gemini"
     debug: bool = False
@@ -214,9 +217,24 @@ class SimulatorService:
         }
         self.sessions: dict[str, dict] = {}
         self.agents: dict[str, Agent] = {}
+        self.event_queues: dict[str, Queue[dict[str, object]]] = {}
         self.reward_calculators: dict[str, RewardCalculator] = {}
         # ponytail: one lock is enough for a local visualizer; split per session if contention appears.
         self.lock = Lock()
+
+    def event_queue(self, session_id: str) -> Queue[dict[str, object]]:
+        with self.lock:
+            if session_id not in self.sessions:
+                raise HTTPException(status_code=404, detail="session not found")
+            return self.event_queues.setdefault(session_id, Queue())
+
+    def publish_event(self, session_id: str, event: dict[str, object]) -> None:
+        self.event_queue(session_id).put(event)
+
+    def attach_agent_events(self, session_id: str, agent: Agent) -> None:
+        setter = getattr(agent, "set_event_sink", None)
+        if callable(setter):
+            setter(session_id, lambda event: self.publish_event(session_id, event))
 
     @staticmethod
     def initial_intent(sample: dict) -> str:
@@ -554,6 +572,7 @@ class SimulatorService:
             agent = self.agents.get(agent_name) or build_agent(agent_name, self.catalog_path)
             self.agents[agent_name] = agent
             agent.reset(session_id, session["sample"]["user_profile"])
+            self.attach_agent_events(session_id, agent)
         except Exception as error:
             with self.lock:
                 session["status"] = "error"
@@ -643,6 +662,7 @@ class SimulatorService:
             agent = self.agents.get(agent_name) or build_agent(agent_name, self.catalog_path)
             self.agents[agent_name] = agent
             agent.reset(session_id, session["sample"]["user_profile"])
+            self.attach_agent_events(session_id, agent)
         except Exception as error:
             with self.lock:
                 session["status"] = "error"
@@ -660,7 +680,19 @@ class SimulatorService:
                 raise HTTPException(status_code=404, detail="human simulator session not found")
             if session["status"] != "waiting_for_simulator":
                 raise HTTPException(status_code=409, detail="session is not waiting for a reply")
-            response = session["agent"].respond(session_id, message, session["current_turn"], TOP_K)
+            if session.get("turn_in_progress"):
+                raise HTTPException(status_code=409, detail="Agent is already responding")
+            session["turn_in_progress"] = True
+            agent = session["agent"]
+            turn = session["current_turn"]
+        try:
+            response = agent.respond(session_id, message, turn, TOP_K)
+        except Exception:
+            with self.lock:
+                session["turn_in_progress"] = False
+            raise
+        with self.lock:
+            session["turn_in_progress"] = False
             recommendations = normalize_recommendations(
                 response.get("recommendations") if isinstance(response, dict) else None,
                 self.catalog_ids,
@@ -676,7 +708,6 @@ class SimulatorService:
                     "hit_rank": None,
                 }
             )
-            turn = session["current_turn"]
             target = session["target"]
             rank = recommendations.index(target) + 1 if target in recommendations else None
             metrics = self.turn_metrics(
@@ -898,6 +929,27 @@ def create_app(
     @app.get("/api/health")
     def health() -> dict:
         return {"status": "ok"}
+
+    @app.get("/api/sessions/{session_id}/events")
+    def session_events(session_id: str) -> StreamingResponse:
+        events = simulator().event_queue(session_id)
+
+        def stream():
+            yield "retry: 1000\n\n"
+            while True:
+                try:
+                    event = events.get(timeout=15)
+                except Empty:
+                    yield ": keepalive\n\n"
+                    continue
+                payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+                yield f"data: {payload}\n\n"
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/api/samples")
     def samples(dataset: str | None = None, scenario: str | None = None) -> list[dict]:

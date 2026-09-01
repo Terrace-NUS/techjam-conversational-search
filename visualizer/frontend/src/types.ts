@@ -42,9 +42,142 @@ export interface DatasetOption {
 
 export type ReplyModel = 'template' | 'deepseek'
 export type EmbeddingProvider = 'gemini' | 'siliconflow'
-export type AgentName = 'baseline' | 'v1'
+export type AgentName = 'baseline' | 'v1' | 'terrace'
 export type Intent = 'discovery' | 'browsing' | 'buying'
 export type SessionMode = 'human_as_agent' | 'human_as_simulator' | 'agent_simulator'
+
+export interface IntentPreference {
+  id: string
+  facet: string | null
+  operator: string | null
+  value: unknown
+  semantic_text: string | null
+  commitment: string
+  evidence_text: string
+}
+
+export interface IntentSnapshot {
+  goal: string | null
+  preferences: IntentPreference[]
+  dont_care_facets: string[]
+  version: number
+}
+
+export interface QueryUnderstandingDiff {
+  goal: { before: string | null; after: string | null; changed: boolean }
+  preferences: { added: IntentPreference[]; removed: IntentPreference[] }
+  dont_care: { added: string[]; removed: string[] }
+  version: { before: number; after: number }
+}
+
+export interface QueryUnderstandingEvent {
+  stage: 'query_understanding'
+  status: 'started' | 'completed' | 'reused' | 'failed'
+  turn: number
+  elapsed_ms?: number
+  diff?: QueryUnderstandingDiff
+  intent?: IntentSnapshot
+  operations?: Array<Record<string, unknown>>
+  interpretation_summary?: string
+  error?: { type: string; message: string }
+}
+
+export interface CompiledQuerySnapshot {
+  intent_version: number
+  q_lex: string
+  q_sem: string
+  search_ready: boolean
+  hard_constraints: Array<Record<string, unknown>>
+  ranking_preferences: Array<Record<string, unknown>>
+  dont_care_facets: string[]
+  directives: Record<string, unknown>
+  requires_clarification: boolean
+  clarification_reason: string | null
+}
+
+export interface QueryCompilerEvent {
+  stage: 'query_compiler'
+  status: 'started' | 'completed' | 'reused' | 'failed'
+  turn: number
+  elapsed_ms?: number
+  compiled_query?: CompiledQuerySnapshot
+  error?: { type: string; message: string }
+}
+
+export interface IntentTransparencyDiagnostics {
+  status: 'healthy' | 'degraded' | 'unavailable'
+  reason_codes: string[]
+  semantic_factor_count: number
+  hard_factor_count: number
+  top_all_hard_compliance: number | null
+  top_mean_hard_factor_compliance: number | null
+  active_facets: string[]
+  dont_care_facets: string[]
+  open_facets: string[]
+}
+
+export interface IntentTransparencyEstimate {
+  intent_version: number
+  goal: string | null
+  transparency: number | null
+  change: number | null
+  direction: 'initial' | 'narrower' | 'broader' | 'stable' | 'moved' | 'unavailable'
+  remaining_intent_volume: number | null
+  catalog_reference_volume: number
+  goal_reference_volume: number | null
+  diagnostics: IntentTransparencyDiagnostics
+}
+
+export interface IntentTransparencyEvent {
+  stage: 'intent_transparency'
+  status: 'started' | 'completed' | 'reused' | 'fallback'
+  turn: number
+  elapsed_ms?: number
+  estimate?: IntentTransparencyEstimate | null
+  applied_transparency?: number | null
+  error?: { type: string; message: string } | null
+}
+
+export interface PipelineProductPreview {
+  title: string
+}
+
+export interface RetrievalRoutePreview {
+  route: string
+  available: boolean
+  hit_count: number
+  top_hits: PipelineProductPreview[]
+}
+
+export interface RetrievalEvent {
+  stage: 'retrieval'
+  status: 'started' | 'completed' | 'reused' | 'failed'
+  turn: number
+  elapsed_ms?: number
+  routes?: RetrievalRoutePreview[]
+  eligible_count?: number
+  fused_count?: number
+  error?: { type: string; message: string } | null
+}
+
+export interface RankingEvent {
+  stage: 'ranking'
+  status: 'started' | 'completed' | 'reused' | 'failed'
+  turn: number
+  elapsed_ms?: number
+  mode?: string
+  candidate_count?: number
+  selected_products?: PipelineProductPreview[]
+  natural_language_reason?: string | null
+  error?: { type: string; message: string } | null
+}
+
+export type AgentPipelineEvent =
+  | QueryUnderstandingEvent
+  | QueryCompilerEvent
+  | IntentTransparencyEvent
+  | RetrievalEvent
+  | RankingEvent
 
 export interface SessionStartOptions {
   mode: SessionMode
