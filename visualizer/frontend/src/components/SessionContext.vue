@@ -32,8 +32,6 @@ const intentEntries = computed(() => Object.entries(props.session.human_context?
           <Badge>{{ session.sample.scenario_type.replaceAll('_', ' ') }}</Badge>
           <Badge variant="secondary">{{ session.sample.difficulty_bucket }}</Badge>
           <Badge variant="outline">{{ session.sample.category_bucket }}</Badge>
-          <Badge v-if="session.agent" variant="outline">{{ session.agent }} agent</Badge>
-          <Badge v-if="session.debug" variant="outline">{{ session.embedding_provider }} embedding</Badge>
         </div>
         <template v-if="session.debug">
           <Separator />
@@ -57,7 +55,7 @@ const intentEntries = computed(() => Object.entries(props.session.human_context?
             Score unavailable: {{ session.metrics.score_error }}
           </p>
         </template>
-        <template v-if="session.mode === 'human_as_agent'">
+        <template v-if="session.mode === 'human_as_agent' || session.mode === 'agent_simulator'">
           <Separator />
           <div>
             <p class="mb-1 font-medium">Customer profile</p>

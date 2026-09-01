@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onMounted, ref, watch } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { CircleAlert, Moon, Palette, Sparkles, Sun } from '@lucide/vue'
 import { AnimatePresence, motion, MotionConfig, useAnimate } from 'motion-v'
 import {
@@ -14,14 +14,16 @@ import {
   stepAutoSession,
   submitAgentTurn,
   submitHumanReply,
+  watchSessionEvents,
 } from './api'
 import AgentComposer from './components/AgentComposer.vue'
 import AutoConversationControls from './components/AutoConversationControls.vue'
 import ConversationTimeline from './components/ConversationTimeline.vue'
 import HumanSimulatorComposer from './components/HumanSimulatorComposer.vue'
+import QueryUnderstandingCard from './components/QueryUnderstandingCard.vue'
 import SessionContext from './components/SessionContext.vue'
 import SessionSetup from './components/SessionSetup.vue'
-import { Badge } from '@/components/ui/badge'
+import TransparencyCard from './components/TransparencyCard.vue'
 import { Button } from '@/components/ui/button'
 import {
   Select,
@@ -34,30 +36,291 @@ import type {
   AgentTurnInput,
   DatasetOption,
   ProductSummary,
+  IntentTransparencyEvent,
+  QueryCompilerEvent,
+  QueryUnderstandingEvent,
+  RankingEvent,
+  RetrievalEvent,
   SampleSummary,
   SessionStartOptions,
   SimulatorSession,
 } from './types'
 import { ATTRIBUTE_QUESTIONS } from './types'
 
-type ThemePalette = 'default' | 'claude'
-const SIMULATOR_REPLY_DELAY_MS = 2000
+type ThemePalette = 'default' | 'claude' | 'whatsapp' | 'discord'
+type Actor = 'agent' | 'simulator'
 
 const samples = ref<SampleSummary[]>([])
 const datasets = ref<DatasetOption[]>([])
 const session = ref<SimulatorSession | null>(null)
 const loading = ref(false)
 const autoRunning = ref(false)
+const autoActor = ref<Actor>('agent')
+const pendingAutoSession = ref<SimulatorSession | null>(null)
+const pendingAgentTurn = ref<number | null>(null)
+const queryUnderstanding = ref<Record<number, QueryUnderstandingEvent>>({})
+const queryCompiler = ref<Record<number, QueryCompilerEvent>>({})
+const intentTransparency = ref<Record<number, IntentTransparencyEvent>>({})
+const retrieval = ref<Record<number, RetrievalEvent>>({})
+const ranking = ref<Record<number, RankingEvent>>({})
+const persistentQueryUnderstanding = ref<QueryUnderstandingEvent | null>(null)
+const persistentTransparency = ref<IntentTransparencyEvent | null>(null)
 const error = ref('')
 const composer = ref<InstanceType<typeof AgentComposer> | null>(null)
 const darkMode = ref(document.documentElement.classList.contains('dark'))
 const themePalette = ref<ThemePalette>(
-  document.documentElement.classList.contains('theme-claude') ? 'claude' : 'default',
+  document.documentElement.classList.contains('theme-discord')
+    ? 'discord'
+    : document.documentElement.classList.contains('theme-whatsapp')
+      ? 'whatsapp'
+      : document.documentElement.classList.contains('theme-claude') ? 'claude' : 'default',
 )
 const [appScope, animateApp] = useAnimate()
+let sessionEvents: EventSource | null = null
+const completedAnimations = new Set<string>()
+const pipelinePlayback = new Map<number, Promise<void>>()
+const pipelineWaiters = new Map<number, {
+  promise: Promise<void>
+  resolve: () => void
+  timer: number
+}>()
+let animationWaiter: {
+  actor: Actor
+  turn: number
+  resolve: () => void
+  timer: number
+} | null = null
+
+function clearAnimationWaiter() {
+  if (!animationWaiter) return
+  window.clearTimeout(animationWaiter.timer)
+  animationWaiter.resolve()
+  animationWaiter = null
+}
+
+function waitForAnimation(actor: Actor, turn: number): Promise<void> {
+  clearAnimationWaiter()
+  const key = `${actor}-${turn}`
+  if (completedAnimations.delete(key)) return Promise.resolve()
+  return new Promise((resolve) => {
+    const finish = () => {
+      if (animationWaiter?.actor === actor && animationWaiter.turn === turn) {
+        animationWaiter = null
+      }
+      resolve()
+    }
+    animationWaiter = {
+      actor,
+      turn,
+      resolve: finish,
+      timer: window.setTimeout(finish, 30_000),
+    }
+  })
+}
+
+function handleAnimationComplete(payload: { actor: Actor; turn: number }) {
+  const key = `${payload.actor}-${payload.turn}`
+  if (animationWaiter?.actor !== payload.actor || animationWaiter.turn !== payload.turn) {
+    completedAnimations.add(key)
+    return
+  }
+  completedAnimations.delete(key)
+  window.clearTimeout(animationWaiter.timer)
+  animationWaiter.resolve()
+}
+
+function beginPipelineWait(turn: number) {
+  const existing = pipelineWaiters.get(turn)
+  if (existing) {
+    window.clearTimeout(existing.timer)
+    existing.resolve()
+  }
+  let resolve = () => {}
+  const promise = new Promise<void>((done) => { resolve = done })
+  const timer = window.setTimeout(() => finishPipelineWait(turn), 30_000)
+  pipelineWaiters.set(turn, { promise, resolve, timer })
+}
+
+function finishPipelineWait(turn: number) {
+  const waiter = pipelineWaiters.get(turn)
+  if (!waiter) return
+  window.clearTimeout(waiter.timer)
+  pipelineWaiters.delete(turn)
+  waiter.resolve()
+}
+
+function waitForPipeline(turn: number): Promise<void> {
+  return pipelineWaiters.get(turn)?.promise ?? Promise.resolve()
+}
+
+function clearPipelinePlayback() {
+  pipelinePlayback.clear()
+  pipelineWaiters.forEach((waiter) => {
+    window.clearTimeout(waiter.timer)
+    waiter.resolve()
+  })
+  pipelineWaiters.clear()
+}
+
+function beginAgentTurn(current: SimulatorSession, turn: number) {
+  pendingAgentTurn.value = turn
+  if (current.agent === 'terrace') {
+    beginPipelineWait(turn)
+    queryUnderstanding.value = {
+      ...queryUnderstanding.value,
+      [turn]: { stage: 'query_understanding', status: 'started', turn },
+    }
+  }
+}
+
+function stageAgentTurn(
+  current: SimulatorSession,
+  userMessage: string,
+  userMessageOriginal: string | null,
+) {
+  session.value = {
+    ...current,
+    current_user_message: null,
+    current_user_message_original: null,
+    turns: [
+      ...current.turns,
+      {
+        user_message: userMessage,
+        user_message_original: userMessageOriginal,
+        agent_message: '',
+        ask_attribute: null,
+        recommendations: [],
+        hit_rank: null,
+        subscore: null,
+        intent_before: current.metrics.current_intent,
+        intent_after: current.metrics.current_intent,
+        intent_changed: false,
+        recommendation_scores: {},
+      },
+    ],
+  }
+}
+
+function delay(milliseconds: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds))
+}
+
+function queueCompilerEvent(current: SimulatorSession, event: QueryCompilerEvent) {
+  const previous = pipelinePlayback.get(event.turn) ?? Promise.resolve()
+  const playback = previous.then(async () => {
+    if (session.value?.id !== current.id) return
+    if (event.status !== 'started') {
+      queryCompiler.value = {
+        ...queryCompiler.value,
+        [event.turn]: { stage: 'query_compiler', status: 'started', turn: event.turn },
+      }
+      await delay(2000)
+      if (session.value?.id !== current.id) return
+    }
+    queryCompiler.value = { ...queryCompiler.value, [event.turn]: event }
+    if (event.status === 'failed') finishPipelineWait(event.turn)
+  })
+  pipelinePlayback.set(event.turn, playback)
+}
+
+function queueTransparencyEvent(current: SimulatorSession, event: IntentTransparencyEvent) {
+  const previous = pipelinePlayback.get(event.turn) ?? Promise.resolve()
+  const playback = previous.then(async () => {
+    if (session.value?.id !== current.id) return
+    if (event.status !== 'started') {
+      intentTransparency.value = {
+        ...intentTransparency.value,
+        [event.turn]: { stage: 'intent_transparency', status: 'started', turn: event.turn },
+      }
+      await delay(2000)
+      if (session.value?.id !== current.id) return
+    }
+    intentTransparency.value = { ...intentTransparency.value, [event.turn]: event }
+    if (event.status === 'completed' || event.status === 'reused') {
+      persistentTransparency.value = event
+    }
+  })
+  pipelinePlayback.set(event.turn, playback)
+}
+
+function queueRetrievalEvent(current: SimulatorSession, event: RetrievalEvent) {
+  const previous = pipelinePlayback.get(event.turn) ?? Promise.resolve()
+  const playback = previous.then(async () => {
+    if (session.value?.id !== current.id) return
+    if (event.status !== 'started') {
+      retrieval.value = {
+        ...retrieval.value,
+        [event.turn]: { stage: 'retrieval', status: 'started', turn: event.turn },
+      }
+      await delay(2000)
+      if (session.value?.id !== current.id) return
+    }
+    retrieval.value = { ...retrieval.value, [event.turn]: event }
+    if (event.status === 'failed') finishPipelineWait(event.turn)
+  })
+  pipelinePlayback.set(event.turn, playback)
+}
+
+function queueRankingEvent(current: SimulatorSession, event: RankingEvent) {
+  const previous = pipelinePlayback.get(event.turn) ?? Promise.resolve()
+  const playback = previous.then(async () => {
+    if (session.value?.id !== current.id) return
+    if (event.status !== 'started') {
+      ranking.value = {
+        ...ranking.value,
+        [event.turn]: { stage: 'ranking', status: 'started', turn: event.turn },
+      }
+      await delay(2000)
+      if (session.value?.id !== current.id) return
+    }
+    ranking.value = { ...ranking.value, [event.turn]: event }
+    if (event.status !== 'started') finishPipelineWait(event.turn)
+  })
+  pipelinePlayback.set(event.turn, playback)
+}
+
+function connectSessionEvents(current: SimulatorSession) {
+  sessionEvents?.close()
+  sessionEvents = null
+  queryUnderstanding.value = {}
+  queryCompiler.value = {}
+  intentTransparency.value = {}
+  retrieval.value = {}
+  ranking.value = {}
+  persistentQueryUnderstanding.value = null
+  persistentTransparency.value = null
+  clearPipelinePlayback()
+  if (current.agent !== 'terrace') return
+  sessionEvents = watchSessionEvents(current.id, (event) => {
+    if (session.value?.id !== current.id) return
+    if (event.stage === 'query_understanding') {
+      queryUnderstanding.value = { ...queryUnderstanding.value, [event.turn]: event }
+      if (event.status === 'completed' || event.status === 'reused') {
+        persistentQueryUnderstanding.value = event
+      }
+      if (event.status === 'failed') finishPipelineWait(event.turn)
+    } else if (event.stage === 'query_compiler') {
+      queueCompilerEvent(current, event)
+    } else if (event.stage === 'intent_transparency') {
+      queueTransparencyEvent(current, event)
+    } else if (event.stage === 'retrieval') {
+      queueRetrievalEvent(current, event)
+    } else {
+      queueRankingEvent(current, event)
+    }
+  })
+}
+
+onBeforeUnmount(() => {
+  sessionEvents?.close()
+  clearAnimationWaiter()
+  clearPipelinePlayback()
+})
 
 watch(themePalette, (palette) => {
   document.documentElement.classList.toggle('theme-claude', palette === 'claude')
+  document.documentElement.classList.toggle('theme-whatsapp', palette === 'whatsapp')
+  document.documentElement.classList.toggle('theme-discord', palette === 'discord')
   localStorage.setItem('theme-palette', palette)
 })
 
@@ -116,6 +379,7 @@ async function start(options: SessionStartOptions) {
             options.debug,
           )
     session.value = created
+    connectSessionEvents(created)
     await nextTick()
     const initialized = options.mode === 'human_as_agent'
       ? await initializeSession(created.id)
@@ -124,6 +388,9 @@ async function start(options: SessionStartOptions) {
         : await initializeAutoSession(created.id)
     if (session.value?.id !== created.id) return
     session.value = initialized
+    autoActor.value = 'agent'
+    pendingAutoSession.value = null
+    pendingAgentTurn.value = null
     if (session.value?.status === 'error') {
       throw new Error(session.value.initialization_error ?? 'Could not generate first reply')
     }
@@ -137,16 +404,62 @@ async function start(options: SessionStartOptions) {
 async function advanceAuto(): Promise<boolean> {
   if (!session.value || session.value.mode !== 'agent_simulator') return false
   const sessionId = session.value.id
-  loading.value = true
   error.value = ''
+
+  if (autoActor.value === 'simulator') {
+    const nextSession = pendingAutoSession.value
+    if (!nextSession || nextSession.id !== sessionId) return false
+    loading.value = true
+    try {
+      session.value = nextSession
+      pendingAutoSession.value = null
+      await nextTick()
+      if (nextSession.current_user_message) {
+        await waitForAnimation('simulator', nextSession.current_turn)
+      }
+      autoActor.value = 'agent'
+      return nextSession.status === 'waiting_for_agent'
+    } finally {
+      loading.value = false
+    }
+  }
+
+  const previousSession = session.value
+  const turn = previousSession.current_turn
+  const userMessage = previousSession.current_user_message ?? ''
+  const userMessageOriginal = previousSession.current_user_message_original
+  loading.value = true
+  beginAgentTurn(previousSession, turn)
+  stageAgentTurn(previousSession, userMessage, userMessageOriginal)
   try {
     const nextSession = await stepAutoSession(sessionId)
     if (session.value?.id !== sessionId) return false
-    session.value = nextSession
+    await waitForPipeline(turn)
+    const newTurn = nextSession.turns.at(-1)
+    if (!newTurn) throw new Error('Agent response did not include a turn')
+    session.value = {
+      ...nextSession,
+      status: 'waiting_for_agent',
+      current_turn: turn,
+      current_user_message: null,
+      current_user_message_original: null,
+      turns: [...nextSession.turns.slice(0, -1), newTurn],
+    }
     await nextTick()
-    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })
-    return nextSession.status === 'waiting_for_agent'
+    await waitForAnimation('agent', turn)
+    pendingAgentTurn.value = null
+
+    if (!nextSession.current_user_message) {
+      session.value = nextSession
+      return false
+    }
+    await delay(1000)
+    pendingAutoSession.value = nextSession
+    autoActor.value = 'simulator'
+    return true
   } catch (cause) {
+    session.value = previousSession
+    pendingAgentTurn.value = null
     error.value = cause instanceof Error ? cause.message : 'Could not run the next turn'
     return false
   } finally {
@@ -161,9 +474,7 @@ async function toggleAuto() {
   }
   autoRunning.value = true
   try {
-    while (autoRunning.value && await advanceAuto()) {
-      await new Promise((resolve) => setTimeout(resolve, 900))
-    }
+    while (autoRunning.value && await advanceAuto()) {}
   } finally {
     autoRunning.value = false
   }
@@ -172,14 +483,22 @@ async function toggleAuto() {
 async function replyAsSimulator(message: string) {
   if (!session.value) return
   const previousSession = session.value
+  const turn = previousSession.current_turn
   loading.value = true
   error.value = ''
+  beginAgentTurn(previousSession, turn)
+  stageAgentTurn(previousSession, message, null)
   try {
-    session.value = await submitHumanReply(previousSession.id, message)
+    const nextSession = await submitHumanReply(previousSession.id, message)
+    await waitForPipeline(turn)
+    session.value = nextSession
+    await nextTick()
+    await waitForAnimation('agent', turn)
   } catch (cause) {
     session.value = previousSession
     error.value = cause instanceof Error ? cause.message : 'Could not get Agent response'
   } finally {
+    pendingAgentTurn.value = null
     loading.value = false
   }
 }
@@ -212,14 +531,13 @@ async function submit(input: AgentTurnInput, products: ProductSummary[]) {
       ],
     }
     await nextTick()
-    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })
-    const replyDelay = new Promise((resolve) => setTimeout(resolve, SIMULATOR_REPLY_DELAY_MS))
     const nextSession = await response
-    if (nextSession.status === 'waiting_for_agent') await replyDelay
     session.value = nextSession
     composer.value?.clear()
     await nextTick()
-    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })
+    if (nextSession.current_user_message) {
+      await waitForAnimation('simulator', nextSession.current_turn)
+    }
   } catch (cause) {
     session.value = previousSession
     error.value = cause instanceof Error ? cause.message : 'Could not submit turn'
@@ -230,6 +548,19 @@ async function submit(input: AgentTurnInput, products: ProductSummary[]) {
 
 function reset() {
   autoRunning.value = false
+  autoActor.value = 'agent'
+  pendingAutoSession.value = null
+  pendingAgentTurn.value = null
+  completedAnimations.clear()
+  clearAnimationWaiter()
+  sessionEvents?.close()
+  sessionEvents = null
+  queryUnderstanding.value = {}
+  queryCompiler.value = {}
+  intentTransparency.value = {}
+  persistentQueryUnderstanding.value = null
+  persistentTransparency.value = null
+  clearPipelinePlayback()
   session.value = null
   error.value = ''
 }
@@ -245,14 +576,11 @@ function reset() {
             <Sparkles class="size-4" />
           </div>
           <div>
-            <h1 class="font-semibold tracking-tight">Conversational Search Lab</h1>
+            <h1 class="font-semibold tracking-tight">APERTURE</h1>
             <p class="text-xs text-muted-foreground">Simulator visualizer</p>
           </div>
         </div>
         <div class="flex items-center gap-2">
-          <Badge variant="outline" class="hidden sm:inline-flex">
-            {{ session?.mode === 'human_as_simulator' ? 'Human as Simulator' : session?.mode === 'agent_simulator' ? 'Agent ↔ Simulator' : 'Human as Agent' }}
-          </Badge>
           <Select v-model="themePalette">
             <SelectTrigger class="w-[8.5rem]" aria-label="Theme palette">
               <Palette class="size-4" />
@@ -261,6 +589,8 @@ function reset() {
             <SelectContent>
               <SelectItem value="default">Default</SelectItem>
               <SelectItem value="claude">Claude</SelectItem>
+              <SelectItem value="whatsapp">Whatsapp</SelectItem>
+              <SelectItem value="discord">Discord</SelectItem>
             </SelectContent>
           </Select>
           <Button
@@ -327,38 +657,56 @@ function reset() {
           :transition="{ duration: 0.28, ease: 'easeOut' }"
         >
           <SessionContext :session="session" class="xl:sticky xl:top-5" @reset="reset" />
-          <ConversationTimeline :session="session" />
-          <AgentComposer
-            v-if="session.mode === 'human_as_agent' && session.status === 'waiting_for_agent'"
-            ref="composer"
-            class="xl:sticky xl:top-5"
-            :loading="loading"
-            @submit="submit"
-          />
-          <HumanSimulatorComposer
-            v-else-if="session.mode === 'human_as_simulator' && session.status === 'waiting_for_simulator'"
+          <ConversationTimeline
             :session="session"
-            :loading="loading"
-            class="xl:sticky xl:top-5"
-            @reply="replyAsSimulator"
+            :query-understanding="queryUnderstanding"
+            :query-compiler="queryCompiler"
+            :intent-transparency="intentTransparency"
+            :retrieval="retrieval"
+            :ranking="ranking"
+            :pending-agent-turn="pendingAgentTurn"
+            @animation-complete="handleAnimationComplete"
           />
-          <AutoConversationControls
-            v-else-if="session.mode === 'agent_simulator' && session.status === 'waiting_for_agent'"
-            :loading="loading"
-            :running="autoRunning"
-            class="xl:sticky xl:top-5"
-            @step="advanceAuto"
-            @toggle="toggleAuto"
-          />
-          <div
-            v-else-if="session.status === 'initializing'"
-            class="rounded-xl border bg-card p-6 text-center text-sm text-muted-foreground"
-          >
-            {{ session.mode === 'human_as_simulator' ? 'Preparing Agent…' : session.mode === 'agent_simulator' ? 'Preparing Agent and Simulator…' : 'Simulator is preparing the first reply…' }}
-          </div>
-          <div v-else class="rounded-xl border bg-card p-6 text-center text-sm text-muted-foreground">
-            This session is complete. Review the target and conversation, or start a new case.
-          </div>
+          <aside class="space-y-3 xl:sticky xl:top-5">
+            <QueryUnderstandingCard
+              v-if="persistentQueryUnderstanding"
+              card
+              :progress="persistentQueryUnderstanding"
+            />
+            <TransparencyCard
+              v-if="persistentTransparency"
+              :progress="persistentTransparency"
+            />
+            <AgentComposer
+              v-if="session.mode === 'human_as_agent' && session.status === 'waiting_for_agent'"
+              ref="composer"
+              :loading="loading"
+              @submit="submit"
+            />
+            <HumanSimulatorComposer
+              v-else-if="session.mode === 'human_as_simulator' && session.status === 'waiting_for_simulator'"
+              :session="session"
+              :loading="loading"
+              @reply="replyAsSimulator"
+            />
+            <AutoConversationControls
+              v-else-if="session.mode === 'agent_simulator' && session.status === 'waiting_for_agent'"
+              :loading="loading"
+              :running="autoRunning"
+              :actor="autoActor"
+              @step="advanceAuto"
+              @toggle="toggleAuto"
+            />
+            <div
+              v-else-if="session.status === 'initializing'"
+              class="rounded-xl border bg-card p-6 text-center text-sm text-muted-foreground"
+            >
+              {{ session.mode === 'human_as_simulator' ? 'Preparing Agent…' : session.mode === 'agent_simulator' ? 'Preparing Agent and Simulator…' : 'Simulator is preparing the first reply…' }}
+            </div>
+            <div v-else class="rounded-xl border bg-card p-6 text-center text-sm text-muted-foreground">
+              This session is complete. Review the target and conversation, or start a new case.
+            </div>
+          </aside>
         </motion.div>
       </AnimatePresence>
     </main>

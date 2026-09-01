@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { Play } from '@lucide/vue'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -86,14 +85,6 @@ watch(
 <template>
   <Card class="w-full max-w-2xl border-0 shadow-xl shadow-slate-200/60 dark:shadow-black/30">
     <CardHeader class="space-y-3">
-      <div class="flex items-center gap-2">
-        <Badge variant="secondary">
-          {{ mode === 'human_as_agent' ? 'Human as Agent' : mode === 'human_as_simulator' ? 'Human as Simulator' : 'Agent ↔ Simulator' }}
-        </Badge>
-        <Badge variant="outline">
-          {{ mode === 'human_as_agent' ? (replyModel === 'deepseek' ? 'DeepSeek replies' : 'Template replies') : mode === 'human_as_simulator' ? `${agent} agent` : `${agent} · ${replyModel}` }}
-        </Badge>
-      </div>
       <CardTitle class="text-2xl">Start a product-guessing session</CardTitle>
       <CardDescription class="max-w-xl leading-6">
         {{ mode === 'human_as_agent'
@@ -153,6 +144,7 @@ watch(
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
+              <SelectItem value="terrace">Aperture</SelectItem>
               <SelectItem value="v1">V1</SelectItem>
               <SelectItem value="baseline">Baseline</SelectItem>
             </SelectContent>
@@ -205,10 +197,7 @@ watch(
         </div>
       </div>
 
-      <div
-        v-if="mode !== 'human_as_simulator'"
-        class="rounded-lg border bg-muted/40 p-4 text-sm text-muted-foreground"
-      >
+      <div class="rounded-lg border bg-muted/40 p-4 text-sm text-muted-foreground">
         <label class="flex cursor-pointer items-start gap-3">
           <input v-model="debug" type="checkbox" class="mt-0.5 size-4 accent-primary" />
           <span>

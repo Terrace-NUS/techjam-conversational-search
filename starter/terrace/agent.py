@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from shopping_copilot.application import RealWorldConfig, build_real_world_agent
@@ -51,3 +52,12 @@ class TerraceAgent(Agent):
         if not callable(method):
             raise LookupError("Terrace agent does not provide turn audits")
         return method(session_id)
+
+    def set_event_sink(
+        self,
+        session_id: str,
+        sink: Callable[[dict[str, object]], None] | None,
+    ) -> None:
+        method = getattr(self._delegate, "set_event_sink", None)
+        if callable(method):
+            method(session_id, sink)

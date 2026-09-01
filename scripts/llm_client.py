@@ -67,7 +67,12 @@ ATTRIBUTE_SYSTEM_PROMPT = (
     "Describe only the requested attribute. Earlier-stage maps set the ambiguity level; only the "
     "same attribute's earlier clues supply facts. Never borrow or remix facts from sibling attributes. "
     "The same attribute is generated independently for buying, browsing, and discovery. "
-    "Buying is the least ambiguous: preserve every supplied fact and exact value. Browsing is "
+    "Buying is the least ambiguous, but it must still sound like a customer requirement rather "
+    "than a copied catalog listing. Category, brand, budget, material, color, and size may keep "
+    "explicit values. For feature, style, use_case, and other, preserve the semantic requirement "
+    "while generalizing listing-specific wording by one level: do not return the supplied value "
+    "verbatim, reuse any three consecutive source words, expose model or product names, or retain "
+    "nonessential exact numbers, including numbers written as words. Browsing is "
     "tentative: generalize the supplied value by one level without echoing it, inventing facts, "
     "adding unsupported qualities, or calling a known value unspecified or undecided. Discovery is "
     "the most ambiguous: use a broad need, benefit, "
@@ -83,7 +88,8 @@ ATTRIBUTE_SYSTEM_PROMPT = (
     "undecided unless a non-identifying need is explicitly supported. Category: buying names the "
     "product type; browsing uses a broader family; discovery gives only the underlying goal and "
     "must not mention body location, object purpose, or product-family synonyms. Feature, style, "
-    "use_case, color, and other: buying preserves all facts; browsing generalizes them one level; "
+    "use_case, and other: buying states a concrete but non-identifying requirement; browsing "
+    "generalizes it one further level. Color follows material specificity. "
     "discovery keeps only a non-identifying benefit, aesthetic, or use need. Never add adjectives "
     "such as durable, premium, affordable, lightweight, or comfortable unless explicitly supplied. "
     "Never strengthen a claim: water-resistant must not become waterproof or weatherproof, and "
@@ -94,7 +100,7 @@ ATTRIBUTE_SYSTEM_PROMPT = (
     "The prompt includes the complete earlier-stage maps for all attributes. Use them as context, "
     "never copy their wording into a later stage. Buying -> browsing -> discovery must become "
     "visibly less specific. Example progression: "
-    "['Triple Moon Pentagram Symbol'] -> ['celestial symbolic motif'] -> ['mystical aesthetic']; "
+    "['pagan moon-and-star motif'] -> ['celestial symbolic motif'] -> ['mystical aesthetic']; "
     "['alloy'] -> ['metal-based'] -> ['material undecided']; "
     "['necklace'] -> ['personal jewelry'] -> ['outfit accent']; "
     "['wrist watch'] -> ['timepiece'] -> ['daily routine support']; "
@@ -279,7 +285,10 @@ class DeepSeekAttributeWriter:
             {"role": "system", "content": ATTRIBUTE_SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ]
-        for attempt in range(2):
+        attempts = 4 if stage == "buying" and attribute in {
+            "feature", "style", "use_case", "other"
+        } else 2
+        for attempt in range(attempts):
             response = self.client.chat.completions.create(
                 model=self.model,
                 temperature=0,
@@ -296,7 +305,7 @@ class DeepSeekAttributeWriter:
                 )
                 return clues
             except ValueError as error:
-                if attempt == 1:
+                if attempt == attempts - 1:
                     raise
                 messages.append({"role": "assistant", "content": content or ""})
                 messages.append(
@@ -590,6 +599,49 @@ class DeepSeekAttributeWriter:
                     for number in re.findall(r"\d+(?:\.\d+)?", combined)
                 ):
                     raise ValueError("buying budget must include the exact price")
+            if attribute in {"feature", "style", "use_case", "other"}:
+                source_tokens = re.findall(r"[a-z0-9]+", value.casefold())
+                clue_tokens = re.findall(r"[a-z0-9]+", combined)
+                if clue_tokens == source_tokens:
+                    raise ValueError("buying descriptive clue must not copy the catalog value")
+                source_ngrams = {
+                    tuple(source_tokens[index : index + 3])
+                    for index in range(len(source_tokens) - 2)
+                }
+                clue_ngrams = {
+                    tuple(clue_tokens[index : index + 3])
+                    for index in range(len(clue_tokens) - 2)
+                }
+                if source_ngrams & clue_ngrams:
+                    raise ValueError(
+                        "buying descriptive clue must not copy three consecutive source words"
+                    )
+                number_words = (
+                    "zero", "one", "two", "three", "four", "five", "six", "seven",
+                    "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+                    "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+                    "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+                    "hundred", "thousand", "half", "quarter",
+                )
+                if re.search(r"\d", combined) or any(
+                    re.search(rf"\b{word}\b", combined) for word in number_words
+                ):
+                    raise ValueError(
+                        "buying descriptive clue must generalize nonessential exact numbers"
+                    )
+                unsupported = (
+                    "durable", "premium", "affordable", "lightweight", "comfortable",
+                    "waterproof", "weatherproof",
+                )
+                invented = [
+                    word
+                    for word in unsupported
+                    if word in combined and word not in value.casefold()
+                ]
+                if invented:
+                    raise ValueError(
+                        f"buying descriptive clue must not invent or strengthen qualities: {invented!r}"
+                    )
             return
         raw_value = value.strip().casefold()
         if attribute == "brand" and any(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import hashlib
 import math
@@ -7,6 +8,7 @@ import os
 import random
 import statistics
 import ssl
+import time
 import urllib.error
 import urllib.request
 import threading
@@ -77,6 +79,7 @@ class GeminiEmbeddingClient:
         cache_dir: str | Path = "data/cache/embeddings",
         timeout: float = 30.0,
         output_dimensionality: int | None = None,
+        retries: int = 4,
     ) -> None:
         _load_dotenv()
         self.api_key = (
@@ -99,6 +102,9 @@ class GeminiEmbeddingClient:
             raise ValueError("output_dimensionality must be positive")
         self.cache_dir = Path(cache_dir)
         self.timeout = timeout
+        if retries < 0:
+            raise ValueError("retries must be non-negative")
+        self.retries = retries
 
     def embed(self, asin: str, text: str) -> list[float]:
         """Return the embedding for `text`, invalidating stale ASIN caches."""
@@ -156,16 +162,28 @@ class GeminiEmbeddingClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout, context=_SSL_CONTEXT) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Gemini embedContent request failed ({error.code}): {detail}") from error
-        values = body.get("embedding", {}).get("values")
-        if not isinstance(values, list) or not values:
-            raise ValueError(f"Gemini embedContent response missing values: {body}")
-        return values
+        for attempt in range(self.retries + 1):
+            try:
+                with urllib.request.urlopen(
+                    request, timeout=self.timeout, context=_SSL_CONTEXT
+                ) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")
+                if error.code not in {429, 500, 502, 503, 504} or attempt == self.retries:
+                    raise RuntimeError(
+                        f"Gemini embedContent request failed ({error.code}): {detail}"
+                    ) from error
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                if attempt == self.retries:
+                    raise
+            else:
+                values = body.get("embedding", {}).get("values")
+                if not isinstance(values, list) or not values:
+                    raise ValueError(f"Gemini embedContent response missing values: {body}")
+                return values
+            time.sleep(min(8.0, 0.5 * (2**attempt)))
+        raise AssertionError("embedding retry loop must return or raise")
 
 
 class SiliconFlowEmbeddingClient(GeminiEmbeddingClient):
@@ -221,13 +239,21 @@ class RewardCalculator:
         text_fn: Callable[[dict], str],
         baseline_sample_size: int = 32,
         baseline_cache_path: str | Path = "data/cache/baselines.json",
+        embedding_workers: int = 8,
     ) -> None:
+        if embedding_workers < 1:
+            raise ValueError("embedding_workers must be positive")
         self.embedding_client = embedding_client
         self.text_fn = text_fn
         self.baseline_sample_size = max(0, baseline_sample_size)
         self.baseline_cache_path = Path(baseline_cache_path)
+        self._embedding_executor = ThreadPoolExecutor(max_workers=embedding_workers)
+        self._embedding_lock = threading.Lock()
+        self._embedding_cache: dict[tuple[str, str], list[float]] = {}
+        self._embedding_futures: dict[tuple[str, str], Future[list[float]]] = {}
         self._baseline_cache: dict[str, float] = {}
         self._baseline_lock = threading.Lock()
+        self._baseline_target_locks: dict[str, threading.Lock] = {}
         self._baseline_metadata: dict[str, object] | None = None
 
     def score_turn(self, ranked: list[str], target_asin: str, products: dict[str, dict]) -> float:
@@ -245,15 +271,18 @@ class RewardCalculator:
         target_product = products.get(target_asin)
         if target_product is None:
             return 0.0
-        target_vector = self.embedding_client.embed(target_asin, self.text_fn(target_product))
+        ranked_asins = [asin for asin in dict.fromkeys(ranked) if asin in products]
+        if not ranked_asins:
+            return 0.0
+        vectors = self._embed_many([target_asin, *ranked_asins], products)
+        target_vector = vectors[target_asin]
+        baseline = self._target_baseline(
+            target_asin, ranked_asins[0], target_vector, products
+        )
         scores = []
-        for asin in dict.fromkeys(ranked):
-            product = products.get(asin)
-            if product is None:
-                continue
-            vector = self.embedding_client.embed(asin, self.text_fn(product))
+        for asin in ranked_asins:
+            vector = vectors[asin]
             raw_similarity = min(1.0, max(0.0, cosine_similarity(vector, target_vector)))
-            baseline = self._target_baseline(target_asin, asin, target_vector, products)
             score = (
                 raw_similarity
                 if baseline is None
@@ -265,6 +294,43 @@ class RewardCalculator:
             scores.append(score)
         return max(scores, default=0.0)
 
+    def _embed_many(self, asins: list[str], products: dict[str, dict]) -> dict[str, list[float]]:
+        results: dict[str, list[float]] = {}
+        pending: list[tuple[str, tuple[str, str], Future[list[float]]]] = []
+        for asin in dict.fromkeys(asins):
+            product = products.get(asin)
+            if product is None:
+                continue
+            text = self.text_fn(product)
+            key = (asin, hashlib.sha256(text.encode("utf-8")).hexdigest())
+            with self._embedding_lock:
+                cached = self._embedding_cache.get(key)
+                if cached is not None:
+                    results[asin] = cached
+                    continue
+                future = self._embedding_futures.get(key)
+                if future is None:
+                    future = self._embedding_executor.submit(
+                        self.embedding_client.embed, asin, text
+                    )
+                    self._embedding_futures[key] = future
+            pending.append((asin, key, future))
+
+        for asin, key, future in pending:
+            try:
+                vector = future.result()
+            except Exception:
+                with self._embedding_lock:
+                    if self._embedding_futures.get(key) is future:
+                        self._embedding_futures.pop(key, None)
+                raise
+            with self._embedding_lock:
+                self._embedding_cache[key] = vector
+                if self._embedding_futures.get(key) is future:
+                    self._embedding_futures.pop(key, None)
+            results[asin] = vector
+        return results
+
     def _target_baseline(
         self,
         target_asin: str,
@@ -273,35 +339,37 @@ class RewardCalculator:
         products: dict[str, dict],
     ) -> float | None:
         """Return a deterministic in-memory median similarity baseline for target."""
-        cached = self._baseline_cache.get(target_asin)
-        if cached is not None:
-            return cached
         # Keep the rank-1 item out of the negative reference set so it cannot
         # inflate its own baseline.
         candidates = [asin for asin in products if asin not in {target_asin, rank1_asin}]
         if not candidates or self.baseline_sample_size <= 0:
             return None
         with self._baseline_lock:
-            cached = self._baseline_cache.get(target_asin)
-            if cached is not None:
-                return cached
             self._load_baselines(products)
             cached = self._baseline_cache.get(target_asin)
             if cached is not None:
                 return cached
+            target_lock = self._baseline_target_locks.setdefault(target_asin, threading.Lock())
+
+        with target_lock:
+            with self._baseline_lock:
+                cached = self._baseline_cache.get(target_asin)
+                if cached is not None:
+                    return cached
             rng = random.Random(target_asin)
             sample = rng.sample(candidates, min(self.baseline_sample_size, len(candidates)))
-            similarities = []
-            for asin in sample:
-                product = products.get(asin)
-                if product is not None:
-                    vector = self.embedding_client.embed(asin, self.text_fn(product))
-                    similarities.append(max(0.0, cosine_similarity(vector, target_vector)))
+            vectors = self._embed_many(sample, products)
+            similarities = [
+                max(0.0, cosine_similarity(vectors[asin], target_vector))
+                for asin in sample
+                if asin in vectors
+            ]
             if not similarities:
                 return None
             baseline = statistics.median(similarities)
-            self._baseline_cache[target_asin] = baseline
-            self._save_baselines(products)
+            with self._baseline_lock:
+                self._baseline_cache[target_asin] = baseline
+                self._save_baselines(products)
             return baseline
 
     def _load_baselines(self, products: dict[str, dict]) -> None:

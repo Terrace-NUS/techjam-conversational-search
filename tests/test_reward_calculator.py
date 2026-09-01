@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import hashlib
 import tempfile
+import threading
+import urllib.error
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -69,7 +71,35 @@ class RewardCalculatorTest(unittest.TestCase):
             baseline_sample_size=0,
         )
         self.assertEqual(calculator.score_turn(["B", "C"], "A", products), 0.8)
-        self.assertEqual(client.calls, ["A", "B", "C"])
+        self.assertCountEqual(client.calls, ["A", "B", "C"])
+
+    def test_embedding_requests_run_in_parallel(self) -> None:
+        products = {asin: {"title": asin} for asin in ("A", "B", "C", "D")}
+        barrier = threading.Barrier(2)
+
+        class ParallelEmbeddingClient(FakeEmbeddingClient):
+            def embed(self, asin: str, text: str) -> list[float]:
+                barrier.wait(timeout=2)
+                return super().embed(asin, text)
+
+        client = ParallelEmbeddingClient(
+            {
+                "A": [1.0, 0.0],
+                "B": [1.0, 0.0],
+                "C": [0.0, 1.0],
+                "D": [0.0, 1.0],
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            calculator = RewardCalculator(
+                client,
+                text_fn=lambda product: product["title"],
+                baseline_sample_size=2,
+                baseline_cache_path=Path(directory) / "baselines.json",
+                embedding_workers=2,
+            )
+            self.assertEqual(calculator.score_turn(["B"], "A", products), 1.0)
+        self.assertCountEqual(client.calls, ["A", "B", "C", "D"])
 
     def test_miss_scores_relative_to_catalog_baseline(self) -> None:
         products = {asin: {"title": asin} for asin in ("A", "B", "C", "D")}
@@ -138,6 +168,21 @@ class GeminiEmbeddingClientTest(unittest.TestCase):
             self.assertEqual(
                 payload["text_hash"], hashlib.sha256(expected.encode("utf-8")).hexdigest()
             )
+
+    def test_request_retries_transient_ssl_connection_error(self) -> None:
+        client = GeminiEmbeddingClient(api_key="test-key", retries=1)
+        error = urllib.error.URLError("temporary SSL EOF")
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps(
+            {"embedding": {"values": [0.1, 0.2]}}
+        ).encode("utf-8")
+        with mock.patch(
+            "scripts.reward_calculator.urllib.request.urlopen",
+            side_effect=[error, response],
+        ) as urlopen, mock.patch("scripts.reward_calculator.time.sleep"):
+            self.assertEqual(client._request("text"), [0.1, 0.2])
+        self.assertEqual(urlopen.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,7 @@ def build_reconcile_request(
     last_assistant_message: str | None = None,
     last_question: str | None = None,
     allowed_dont_care_facets: tuple[str, ...] | None = None,
+    user_profile: dict[str, object] | None = None,
 ) -> ReconcileRequest:
     """Create the complete QU input without SearchBelief, C_t, or internal IDs."""
 
@@ -58,6 +59,8 @@ def build_reconcile_request(
         raise ValueError("latest utterance must be non-empty")
     if type(current_intent) is not IntentState:
         raise TypeError("current_intent must be an exact IntentState")
+    if user_profile is not None and type(user_profile) is not dict:
+        raise TypeError("user_profile must be a dict or None")
     category_refs = {option.scope_id: option.ref for option in category_options}
     active = tuple(
         _active_preference_view(
@@ -86,6 +89,7 @@ def build_reconcile_request(
         category_options=category_options,
         shown_products=shown_products,
         allowed_dont_care_facets=allowed,
+        user_profile=None if user_profile is None else dict(user_profile),
     )
 
 
@@ -96,6 +100,7 @@ def request_payload(request: ReconcileRequest) -> dict[str, object]:
         "turn": request.turn,
         "base_intent_version": request.base_intent_version,
         "latest_utterance": request.latest_utterance,
+        "user_profile": request.user_profile,
         "current_intent": {
             "goal": request.current_goal,
             "active_preferences": [

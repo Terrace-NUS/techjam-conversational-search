@@ -4,6 +4,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Lock
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -12,6 +14,25 @@ from visualizer.backend.app.main import SimulatorService, create_app
 
 
 class VisualizerApiTest(unittest.TestCase):
+    def test_agent_events_are_queued_for_sse(self) -> None:
+        class EventAgent:
+            sink = None
+
+            def set_event_sink(self, session_id, sink):
+                self.sink = sink
+
+        service = SimulatorService.__new__(SimulatorService)
+        service.sessions = {"session-1": {}}
+        service.event_queues = {}
+        service.lock = Lock()
+        agent = EventAgent()
+
+        service.attach_agent_events("session-1", agent)
+        event = {"stage": "query_understanding", "status": "completed", "turn": 1}
+        agent.sink(event)
+
+        self.assertEqual(service.event_queue("session-1").get_nowait(), event)
+
     def test_turn_subscore_is_maximum_recommendation_score(self) -> None:
         class FixedScores:
             def score_turn(self, ranked, target, products):
@@ -184,6 +205,23 @@ class VisualizerApiTest(unittest.TestCase):
                 ).json()
                 self.assertEqual(len(auto_view["turns"]), 1)
                 self.assertEqual(auto_view["current_turn"], 2)
+
+                with patch("visualizer.backend.app.main.build_agent") as build_agent:
+                    terrace_view = client.post(
+                        "/api/human-sessions",
+                        json={
+                            "sample_id": "override-1",
+                            "dataset": "samples",
+                            "agent": "terrace",
+                        },
+                    ).json()
+                    terrace_view = client.post(
+                        f"/api/human-sessions/{terrace_view['id']}/initialize"
+                    ).json()
+
+                    self.assertEqual(terrace_view["agent"], "terrace")
+                    self.assertEqual(terrace_view["status"], "waiting_for_simulator")
+                    build_agent.assert_called_once_with("terrace", catalog)
 
     def test_boundary_reply_and_turn_limit_match_evaluator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

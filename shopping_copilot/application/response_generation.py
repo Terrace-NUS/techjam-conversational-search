@@ -4,17 +4,29 @@ from __future__ import annotations
 
 import math
 import textwrap
-from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 from shopping_copilot.retrieval.deepseek_ranking import QualityRankingHit
-from shopping_copilot.session_context import Commitment, IntentState, Operator, Preference
+from shopping_copilot.session_context import IntentState
 
 from .quality_ranking import RealWorldRankingResult
 
-RESPONSE_SCHEMA = "shopping-copilot/deterministic-response-narrative/v1"
+RESPONSE_SCHEMA = "shopping-copilot/deterministic-response-narrative/v2"
 TRANSPARENCY_MOVEMENT_THRESHOLD = 0.12
+ATTRIBUTE_QUESTIONS = {
+    "category": "What kind of product are you looking for?",
+    "feature": "Which product feature matters most to you?",
+    "material": "Do you have a preferred material?",
+    "budget": "What budget should I stay within?",
+    "style": "What style do you prefer?",
+    "brand": "Do you have a preferred brand?",
+    "other": "What other product requirement or preference matters to you?",
+    "use_case": "What will you mainly use it for?",
+    "size": "Are there any size or fit requirements?",
+    "color": "Do you have a preferred color?",
+}
+ATTRIBUTE_ORDER = tuple(ATTRIBUTE_QUESTIONS)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -38,12 +50,13 @@ class ResponseNarrative:
     movement: str
     category_labels: tuple[str, ...]
     products: tuple[ProductNarrative, ...]
+    question_attribute: str
     follow_up: str
     message: str
 
 
 class DeterministicResponseComposer:
-    """Make T and ranking evidence visible without another model call."""
+    """Keep ranking evidence for audit while emitting one explicit question."""
 
     def __init__(self, *, maximum_product_notes: int = 3) -> None:
         if type(maximum_product_notes) is not int or maximum_product_notes <= 0:
@@ -59,6 +72,7 @@ class DeterministicResponseComposer:
         ranking: RealWorldRankingResult | None,
         intent: IntentState,
         product_metadata: Mapping[str, Mapping[str, object]],
+        asked_attributes: tuple[str, ...] = (),
     ) -> ResponseNarrative:
         _validate_transparency(transparency, name="transparency")
         if previous_transparency is not None:
@@ -72,6 +86,10 @@ class DeterministicResponseComposer:
             raise TypeError("intent must be an exact IntentState")
         if not isinstance(product_metadata, Mapping):
             raise TypeError("product_metadata must be a mapping")
+        if type(asked_attributes) is not tuple or any(
+            type(attribute) is not str for attribute in asked_attributes
+        ):
+            raise TypeError("asked_attributes must be a tuple of strings")
 
         band = _presentation_band(transparency)
         movement = _movement(transparency, previous_transparency)
@@ -85,23 +103,9 @@ class DeterministicResponseComposer:
             )
             for parent_asin in recommendations[: self._maximum_product_notes]
         )
-        follow_up = (
-            "Which requirement can be relaxed so I can reopen the search?"
-            if not recommendations
-            else _follow_up(
-                band=band,
-                displayed_ids=recommendations[: self._maximum_product_notes],
-                intent=intent,
-                quality_hits=quality_hits,
-            )
-        )
-        message = _render_message(
-            recommendations=recommendations,
-            band=band,
-            movement=movement,
-            categories=categories,
-            products=products,
-            follow_up=follow_up,
+        question_attribute, follow_up = _next_question(
+            intent=intent,
+            asked_attributes=asked_attributes,
         )
         return ResponseNarrative(
             schema=RESPONSE_SCHEMA,
@@ -111,8 +115,9 @@ class DeterministicResponseComposer:
             movement=movement,
             category_labels=categories,
             products=products,
+            question_attribute=question_attribute,
             follow_up=follow_up,
-            message=message,
+            message=follow_up,
         )
 
 
@@ -173,117 +178,20 @@ def _product_narrative(
     )
 
 
-def _render_message(
+def _next_question(
     *,
-    recommendations: tuple[str, ...],
-    band: str,
-    movement: str,
-    categories: tuple[str, ...],
-    products: tuple[ProductNarrative, ...],
-    follow_up: str,
-) -> str:
-    if not recommendations:
-        return (
-            f"I couldn't find a reliable match after applying the current requirements. {follow_up}"
-        )
-
-    category_phrase = _natural_list(categories)
-    if movement == "narrowed":
-        lead = (
-            "Your latest detail narrowed the search, so I shifted from exploration "
-            "toward the closest matches."
-        )
-    elif movement == "broadened":
-        lead = "Your latest change reopened the search, so I broadened the selection"
-        lead += (
-            f" across {category_phrase}."
-            if category_phrase
-            else " across several genuinely different directions."
-        )
-    elif band == "broad":
-        lead = "Your request is still fairly open, so I kept the selection broad"
-        lead += (
-            f" across {category_phrase} instead of filling it with near-duplicates."
-            if category_phrase
-            else " across several product directions instead of filling it with near-duplicates."
-        )
-    elif band == "narrowing":
-        lead = (
-            "I have started to narrow the search while keeping a few genuinely "
-            "different options in the shortlist."
-        )
-    else:
-        lead = (
-            "Your requirements are now specific, so I prioritized the closest matches "
-            "and kept the final set focused."
-        )
-
-    lines = [lead, "", "The strongest options right now are:"]
-    for product in products:
-        note = f"- {product.title}: {product.reason}"
-        if product.caveat is not None:
-            note += f" Note: {product.caveat}"
-        lines.append(note)
-    lines.extend(("", follow_up))
-    return "\n".join(lines)
-
-
-def _follow_up(
-    *,
-    band: str,
-    displayed_ids: tuple[str, ...],
     intent: IntentState,
-    quality_hits: Mapping[str, QualityRankingHit],
-) -> str:
-    unsupported = Counter(
-        preference_id
-        for parent_asin in displayed_ids
-        for preference_id in (
-            quality_hits[parent_asin].unsupported_preference_ids
-            if parent_asin in quality_hits
-            else ()
-        )
+    asked_attributes: tuple[str, ...],
+) -> tuple[str, str]:
+    active = {item.facet for item in intent.preferences if item.facet is not None}
+    unavailable = active | set(intent.dont_care_facets) | set(asked_attributes)
+    if intent.goal is not None:
+        unavailable.add("category")
+    attribute = next(
+        (candidate for candidate in ATTRIBUTE_ORDER if candidate not in unavailable),
+        "other",
     )
-    preferences = {item.id: item for item in intent.preferences}
-    for preference_id, count in unsupported.most_common():
-        preference = preferences.get(preference_id)
-        if preference is None or count < min(2, len(displayed_ids)):
-            continue
-        label = _preference_label(preference)
-        if preference.commitment is Commitment.HARD:
-            return (
-                f"I could not verify {label} consistently in the product data. "
-                "Should I exclude every option where that detail is not explicitly documented?"
-            )
-        return (
-            f"I could not verify {label} consistently. "
-            "Should I treat it as non-negotiable in the next pass?"
-        )
-    if band == "broad":
-        return "Which direction should I narrow first?"
-    if band == "narrowing":
-        return "Which style or trade-off should I prioritize next?"
-    return "Is there one remaining detail you want me to treat as non-negotiable?"
-
-
-def _preference_label(preference: Preference) -> str:
-    facet = None if preference.facet is None else preference.facet.replace("_", " ")
-    value = _value_text(preference.value)
-    if facet and value:
-        if preference.operator in (Operator.NEQ, Operator.NOT_IN):
-            return f"avoiding {value} for {facet}"
-        return f"the requested {facet} ({value})"
-    if preference.semantic_text:
-        return _shorten(preference.semantic_text, width=100)
-    return _shorten(preference.evidence_text, width=100)
-
-
-def _value_text(value: object) -> str:
-    if value is None:
-        return ""
-    if type(value) is tuple:
-        return _natural_list(tuple(str(item) for item in value))
-    return str(value)
+    return attribute, ATTRIBUTE_QUESTIONS[attribute]
 
 
 def _category_labels(
@@ -316,16 +224,6 @@ def _flatten_strings(value: object) -> list[str]:
             result.extend(_flatten_strings(item))
         return result
     return []
-
-
-def _natural_list(values: tuple[str, ...]) -> str:
-    if not values:
-        return ""
-    if len(values) == 1:
-        return values[0]
-    if len(values) == 2:
-        return f"{values[0]} and {values[1]}"
-    return f"{', '.join(values[:-1])}, and {values[-1]}"
 
 
 def _shorten(value: str, *, width: int) -> str:
